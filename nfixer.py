@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""NFixer - сжатие игровых записей (NVIDIA Instant Replay / ShadowPlay) без видимой потери качества.
+"""NFixer - repairs and compresses game recordings (NVIDIA Instant Replay / ShadowPlay) without visible quality loss.
 
-Что делает:
-  check    - ищет записи, испорченные переполнением буфера Instant Replay (начало ролика перезаписано).
-  estimate - на нескольких случайных роликах подбирает параметры и прогнозирует экономию места.
-  compress - перекодирует H.264 -> HEVC, для каждого файла подбирая максимальное сжатие,
-             при котором VMAF относительно оригинала не опускается ниже заданной планки.
-             Звуковые дорожки копируются без изменений. Оригинал заменяется только после проверки.
-  repair   - без перекодирования отрезает испорченное начало у повреждённых записей.
+Commands:
+  check    - finds recordings damaged by an Instant Replay buffer overflow (the head of the clip is overwritten).
+  estimate - searches settings on a few random clips and predicts the space saving.
+  compress - re-encodes H.264 -> HEVC, picking for every file the strongest compression at which VMAF
+             against the original stays above the target. Audio tracks are copied untouched.
+             The original is replaced only after the result passes verification.
+  repair   - cuts the damaged head off damaged recordings without re-encoding.
 
-Нужны Python 3.9+ и FFmpeg (ffmpeg.exe + ffprobe.exe) с libvmaf.
+Requires Python 3.9+ and FFmpeg (ffmpeg.exe + ffprobe.exe) built with libvmaf.
+Messages are in English by default; --lang ru or NFIXER_LANG=ru switches to Russian.
 """
 import argparse
+import bisect
 import ctypes
 import io
 import json
@@ -33,6 +35,23 @@ JOURNAL = os.path.join(LOG_DIR, "journal.jsonl")
 
 FFMPEG = FFPROBE = None
 _current_proc = None  # ffmpeg, который сейчас работает (чтобы корректно остановить по Ctrl+C)
+LANG = "en"  # язык сообщений: en или ru (параметр --lang или переменная NFIXER_LANG)
+
+
+def L(en, ru):
+    """Вернуть вариант текста на текущем языке."""
+    return ru if LANG == "ru" else en
+
+
+def detect_lang(argv):
+    """Язык нужен ещё до разбора аргументов (от него зависит текст справки), поэтому ищем --lang вручную."""
+    lang = os.environ.get("NFIXER_LANG", "en")
+    for i, x in enumerate(argv):
+        if x == "--lang" and i + 1 < len(argv):
+            lang = argv[i + 1]
+        elif x.startswith("--lang="):
+            lang = x[7:]
+    return lang if lang in ("en", "ru") else "en"
 
 
 # --------------------------------------------------------------------------------------
@@ -56,9 +75,10 @@ def _nvenc_av1(q, gop, preset):
 
 ENCODERS = {
     # имя: (функция аргументов, сетка качества по возрастанию сжатия, стартовая точка подбора, кодек на выходе, описание)
-    "nvenc": (_nvenc_hevc, list(range(26, 39, 2)), 32, "hevc", "HEVC на видеокарте NVIDIA (быстро)"),
-    "x265": (_x265, list(range(18, 31, 2)), 24, "hevc", "HEVC на процессоре (в ~5 раз медленнее, файлы на 10-20%% меньше)"),
-    "av1": (_nvenc_av1, list(range(30, 45, 2)), 38, "av1", "AV1 на видеокарте NVIDIA (ещё ~12%% меньше, но старые версии видеоредакторов такие файлы не открывают)"),
+    "nvenc": (_nvenc_hevc, list(range(26, 39, 2)), 32, "hevc", ("HEVC on an NVIDIA GPU (fast)", "HEVC на видеокарте NVIDIA (быстро)")),
+    "x265": (_x265, list(range(18, 31, 2)), 24, "hevc", ("HEVC on the CPU (~5x slower, files 10-20%% smaller)", "HEVC на процессоре (в ~5 раз медленнее, файлы на 10-20%% меньше)")),
+    "av1": (_nvenc_av1, list(range(30, 45, 2)), 38, "av1", ("AV1 on an NVIDIA GPU (~12%% smaller still, but older video editors cannot open such files)",
+            "AV1 на видеокарте NVIDIA (ещё ~12%% меньше, но старые версии видеоредакторов такие файлы не открывают)")),
 }
 
 
@@ -67,9 +87,9 @@ ENCODERS = {
 # --------------------------------------------------------------------------------------
 def human(n):
     n = float(n)
-    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
-        if abs(n) < 1024 or unit == "ТБ":
-            return f"{n:.0f} {unit}" if unit in ("Б", "КБ") else f"{n:.1f} {unit}" if unit == "МБ" else f"{n:.2f} {unit}"
+    for i, unit in enumerate(L(("B", "KB", "MB", "GB", "TB"), ("Б", "КБ", "МБ", "ГБ", "ТБ"))):
+        if abs(n) < 1024 or i == 4:
+            return f"{n:.0f} {unit}" if i < 2 else f"{n:.1f} {unit}" if i == 2 else f"{n:.2f} {unit}"
         n /= 1024
 
 
@@ -119,7 +139,7 @@ def find_ffmpeg(explicit=None):
         if os.path.isfile(a) and os.path.isfile(b):
             FFMPEG, FFPROBE = a, b
             return
-    sys.exit("Не найден FFmpeg (ffmpeg.exe и ffprobe.exe). Укажите папку через --ffmpeg или переменную NFIXER_FFMPEG.")
+    sys.exit(L("FFmpeg not found (ffmpeg.exe and ffprobe.exe). Point to its folder with --ffmpeg or the NFIXER_FFMPEG variable.", "Не найден FFmpeg (ffmpeg.exe и ffprobe.exe). Укажите папку через --ffmpeg или переменную NFIXER_FFMPEG."))
 
 
 def set_file_times(path, st):
@@ -317,8 +337,16 @@ def probe(path):
            "color_range,color_space,color_transfer,color_primaries:stream_tags:stream_disposition=attached_pic", "-of", "json", path]
     p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if p.returncode != 0:
-        raise RuntimeError("ffprobe: " + (p.stderr.strip()[-300:] or "не удалось прочитать файл"))
+        raise RuntimeError("ffprobe: " + (p.stderr.strip()[-300:] or L("cannot read the file", "не удалось прочитать файл")))
     return json.loads(p.stdout)
+
+
+def video_start(path):
+    """Время показа первого кадра видеодорожки."""
+    for s in probe(path).get("streams", []):
+        if s.get("codec_type") == "video":
+            return float(s.get("start_time") or 0)
+    return 0.0
 
 
 def _frac(s):
@@ -355,7 +383,7 @@ def run_ffmpeg(args, cwd=None, total_frames=0, label=""):
             el = time.time() - t0
             fps = frame / el if el > 0 else 0
             eta = (total_frames - frame) / fps if fps > 0 else 0
-            status(f"   {label} {min(100, frame * 100 // total_frames):3}%  {fps:5.0f} к/с  осталось {hms(eta)}")
+            status(L(f"   {label} {min(100, frame * 100 // total_frames):3}%  {fps:5.0f} fps  {hms(eta)} left", f"   {label} {min(100, frame * 100 // total_frames):3}%  {fps:5.0f} к/с  осталось {hms(eta)}"))
     proc.wait()
     th.join()
     _current_proc = None
@@ -377,7 +405,7 @@ class Source:
         self.audio = [s for s in streams if s.get("codec_type") == "audio"]
         other = [s for s in streams if s.get("codec_type") not in ("video", "audio")]
         if len(vids) != 1:
-            self.reason = "не одна видеодорожка"
+            self.reason = L("not exactly one video stream", "не одна видеодорожка")
             self.v = vids[0] if vids else {}
         else:
             self.v = vids[0]
@@ -387,13 +415,14 @@ class Source:
         self.fps = _frac(v.get("avg_frame_rate", "0/1")) or 60.0
         self.duration = float(v.get("duration") or pr.get("format", {}).get("duration") or 0)
         self.nb_frames = int(v.get("nb_frames") or 0)
+        self.start = float(v.get("start_time") or 0)  # время показа первого кадра
         if not self.reason:
             if other:
-                self.reason = "есть нестандартные дорожки (" + ",".join(sorted({s.get("codec_type", "?") for s in other})) + ")"
+                self.reason = L("has streams other than video and audio (", "есть нестандартные дорожки (") + ",".join(sorted({s.get("codec_type", "?") for s in other})) + ")"
             elif v.get("pix_fmt") != "yuv420p":
-                self.reason = f"формат пикселей {v.get('pix_fmt')} (поддерживается только yuv420p, чтобы не трогать цвета)"
+                self.reason = L(f"pixel format {v.get('pix_fmt')} (only yuv420p is supported, to leave colours untouched)", f"формат пикселей {v.get('pix_fmt')} (поддерживается только yuv420p, чтобы не трогать цвета)")
             elif self.duration <= 0 or self.nb_frames <= 0:
-                self.reason = "не удалось определить длительность"
+                self.reason = L("cannot determine the duration", "не удалось определить длительность")
         self.insp = inspect_mp4(path) if path.lower().endswith((".mp4", ".mov", ".m4v")) else {"damage": "n/a"}
         self.cut_frame = 0
         self.cut_time = 0.0
@@ -424,7 +453,17 @@ class Source:
         if self.duration < length * 2.5:
             fracs = [0.0]
             nwin = min(4.0, max(1, int((self.duration - 0.2) * self.fps)) / self.fps)
-        return [(max(0.0, min(self.duration * fr - nwin / 2, self.duration - nwin - 0.1)), nwin) for fr in fracs]
+        times = [] if self.insp.get("has_ctts") else (self.insp.get("times") or [])
+        out = []
+        for fr in fracs:
+            t = max(0.0, min(self.duration * fr - nwin / 2, self.duration - nwin - 0.1))
+            # Границу окна ставим посередине между двумя кадрами. Тогда небольшой сдвиг меток времени между
+            # исходником и результатом не меняет набор кадров, попавших в окно, и сравнение идёт кадр в кадр.
+            i = bisect.bisect_left(times, t)
+            if 0 < i < len(times):
+                t = self.start + (times[i - 1] + times[i]) / 2
+            out.append((t, nwin))
+        return out
 
     def window_bytes(self, wins):
         """Сколько байт занимает исходное видео в этих окнах."""
@@ -464,7 +503,7 @@ def encode_samples(src, wins, enc_args, out_path):
     args += ["-an", "-fps_mode", "passthrough"] + enc_args + src.color_args() + ["-f", "mp4", out_path]
     rc, err = run_ffmpeg(args)
     if rc != 0 or not os.path.isfile(out_path):
-        raise RuntimeError("пробное кодирование не удалось: " + err.strip()[-300:])
+        raise RuntimeError(L("sample encode failed: ", "пробное кодирование не удалось: ") + err.strip()[-300:])
     return os.path.getsize(out_path)
 
 
@@ -490,13 +529,13 @@ def measure_vmaf(dist_path, dist_wins, src, src_wins, workdir):
     rc, err = run_ffmpeg(args, cwd=workdir)
     lp = os.path.join(workdir, log)
     if rc != 0 or not os.path.isfile(lp):
-        raise RuntimeError("не удалось измерить VMAF: " + err.strip()[-300:])
+        raise RuntimeError(L("VMAF measurement failed: ", "не удалось измерить VMAF: ") + err.strip()[-300:])
     with open(lp, encoding="utf-8") as fh:
         j = json.load(fh)
     os.remove(lp)
     scores = sorted(fr["metrics"]["vmaf"] for fr in j["frames"])
     if not scores:
-        raise RuntimeError("VMAF: нет кадров для сравнения")
+        raise RuntimeError(L("VMAF: no frames to compare", "VMAF: нет кадров для сравнения"))
     n = len(scores)
     return {"mean": sum(scores) / n, "p5": scores[n // 20], "min": scores[0], "frames": n}
 
@@ -526,7 +565,7 @@ def search_quality(src, enc_name, preset, target, min_saving, workdir, fixed_q=N
         res = {"q": q, "vmaf": round(m["mean"], 2), "p5": round(m["p5"], 2), "ratio": round(ratio, 4), "pred_size": pred,
                "ok": quality_ok(m, target)}
         tries.append(res)
-        status(f"   подбор: q={q} -> VMAF {res['vmaf']:.1f} (5%: {res['p5']:.1f}), размер {ratio * 100:.0f}% от исходного")
+        status(L(f"   search: q={q} -> VMAF {res['vmaf']:.1f} (5%: {res['p5']:.1f}), size {ratio * 100:.0f}% of the source", f"   подбор: q={q} -> VMAF {res['vmaf']:.1f} (5%: {res['p5']:.1f}), размер {ratio * 100:.0f}% от исходного"))
         return res
 
     limit = (orig_size or src.size) * (1 - min_saving)
@@ -534,9 +573,9 @@ def search_quality(src, enc_name, preset, target, min_saving, workdir, fixed_q=N
         res = evaluate(fixed_q)
         res["tries"] = tries
         if not res["ok"]:
-            return {"q": None, "why": f"при q={fixed_q} качество ниже планки (VMAF {res['vmaf']})", "tries": tries}
+            return {"q": None, "why": L(f"quality below the target at q={fixed_q} (VMAF {res['vmaf']})", f"при q={fixed_q} качество ниже планки (VMAF {res['vmaf']})"), "tries": tries}
         if res["pred_size"] > limit:
-            return {"q": None, "why": "файл почти не уменьшится", "tries": tries}
+            return {"q": None, "why": L("the file would barely shrink", "файл почти не уменьшится"), "tries": tries}
         return res
     lo, hi = 0, len(grid) - 1
     idx = grid.index(start) if start in grid else len(grid) // 2
@@ -553,9 +592,9 @@ def search_quality(src, enc_name, preset, target, min_saving, workdir, fixed_q=N
         idx = (lo + hi + 1) // 2
     status("")
     if best is None:
-        return {"q": None, "why": "не сжимается без заметной потери качества", "tries": tries}
+        return {"q": None, "why": L("cannot be compressed without visible quality loss", "не сжимается без заметной потери качества"), "tries": tries}
     if best["pred_size"] > limit:
-        return {"q": None, "why": f"выигрыш меньше {min_saving * 100:.0f}%", "tries": tries}
+        return {"q": None, "why": L(f"saving is below {min_saving * 100:.0f}%", f"выигрыш меньше {min_saving * 100:.0f}%"), "tries": tries}
     best = dict(best)
     best["tries"] = tries
     return best
@@ -575,7 +614,7 @@ def full_encode(src, enc_name, preset, q, tmp_path, note):
         if name:
             args += [f"-metadata:s:a:{i}", f"title={name}"]
     args += ["-metadata", f"comment={note}", "-f", "mp4", tmp_path]
-    return run_ffmpeg(args, total_frames=src.kept_frames, label="кодирование")
+    return run_ffmpeg(args, total_frames=src.kept_frames, label=L("encoding", "кодирование"))
 
 
 def copy_trim(src, tmp_path):
@@ -587,8 +626,8 @@ def copy_trim(src, tmp_path):
         name = a.get("tags", {}).get("name") or a.get("tags", {}).get("title")
         if name:
             args += [f"-metadata:s:a:{i}", f"title={name}"]
-    args += ["-metadata", f"comment=NFixer {VERSION}: обрезано повреждённое начало ({src.cut_time:.1f} с)", "-f", "mp4", tmp_path]
-    return run_ffmpeg(args, total_frames=src.kept_frames, label="обрезка")
+    args += ["-metadata", f"comment=NFixer {VERSION}: damaged head cut ({src.cut_time:.1f} s)", "-f", "mp4", tmp_path]
+    return run_ffmpeg(args, total_frames=src.kept_frames, label=L("trimming", "обрезка"))
 
 
 def verify_output(src, out_path, want_codec, stderr_text, trimmed=False):
@@ -603,19 +642,19 @@ def verify_output(src, out_path, want_codec, stderr_text, trimmed=False):
     if trimmed:
         chk = inspect_mp4(out_path, deep=True)
         if chk["damage"] != "none":
-            problems.append("в обрезанном файле остались повреждённые кадры")
+            problems.append(L("the trimmed file still has damaged frames", "в обрезанном файле остались повреждённые кадры"))
         # полное декодирование: все кадры из индекса должны реально показываться
         p = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", out_path],
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
         shown = p.stdout.strip().split(",")[0]
         if shown != str(src.kept_frames):
-            problems.append(f"при декодировании получается кадров: {shown or '?'} вместо {src.kept_frames}")
+            problems.append(L(f"decoding yields {shown or '?'} frames instead of {src.kept_frames}", f"при декодировании получается кадров: {shown or '?'} вместо {src.kept_frames}"))
         elif p.stderr.strip():
-            problems.append("обрезанный файл декодируется с ошибками")
+            problems.append(L("the trimmed file decodes with errors", "обрезанный файл декодируется с ошибками"))
     elif hits:
-        problems.append("при чтении исходника были ошибки декодирования (" + hits[0] + ")")
+        problems.append(L("decode errors while reading the source (", "при чтении исходника были ошибки декодирования (") + hits[0] + ")")
     elif stderr_text.strip():
-        problems.append("ffmpeg сообщил об ошибках: " + stderr_text.strip().splitlines()[-1][:200])
+        problems.append(L("ffmpeg reported errors: ", "ffmpeg сообщил об ошибках: ") + stderr_text.strip().splitlines()[-1][:200])
     try:
         pr = probe(out_path)
     except RuntimeError as ex:
@@ -624,27 +663,27 @@ def verify_output(src, out_path, want_codec, stderr_text, trimmed=False):
     v = [s for s in st if s.get("codec_type") == "video"]
     a = [s for s in st if s.get("codec_type") == "audio"]
     if len(v) != 1:
-        return problems + ["в результате нет видеодорожки"]
+        return problems + [L("the result has no video stream", "в результате нет видеодорожки")]
     v = v[0]
     if want_codec and v.get("codec_name") != want_codec:
-        problems.append(f"кодек {v.get('codec_name')} вместо {want_codec}")
+        problems.append(L(f"codec {v.get('codec_name')} instead of {want_codec}", f"кодек {v.get('codec_name')} вместо {want_codec}"))
     if (v.get("width"), v.get("height")) != (src.width, src.height):
-        problems.append("изменилось разрешение")
+        problems.append(L("resolution changed", "изменилось разрешение"))
     if int(v.get("nb_frames") or 0) != src.kept_frames:
-        problems.append(f"кадров {v.get('nb_frames')} вместо {src.kept_frames}")
+        problems.append(L(f"{v.get('nb_frames')} frames instead of {src.kept_frames}", f"кадров {v.get('nb_frames')} вместо {src.kept_frames}"))
     odur = float(v.get("duration") or 0)
     if abs(odur - src.kept_duration) > 0.05 + 2 / src.fps:
-        problems.append(f"длительность {odur:.2f} с вместо {src.kept_duration:.2f} с")
+        problems.append(L(f"duration {odur:.2f} s instead of {src.kept_duration:.2f} s", f"длительность {odur:.2f} с вместо {src.kept_duration:.2f} с"))
     if len(a) != len(src.audio):
-        problems.append(f"звуковых дорожек {len(a)} вместо {len(src.audio)}")
+        problems.append(L(f"{len(a)} audio tracks instead of {len(src.audio)}", f"звуковых дорожек {len(a)} вместо {len(src.audio)}"))
     else:
         for sa, oa in zip(src.audio, a):
             if oa.get("codec_name") != sa.get("codec_name"):
-                problems.append("изменился кодек звука")
+                problems.append(L("audio codec changed", "изменился кодек звука"))
             if not src.cut_frame and sa.get("nb_frames") and oa.get("nb_frames") != sa.get("nb_frames"):
-                problems.append(f"звук: пакетов {oa.get('nb_frames')} вместо {sa.get('nb_frames')}")
+                problems.append(L(f"audio: {oa.get('nb_frames')} packets instead of {sa.get('nb_frames')}", f"звук: пакетов {oa.get('nb_frames')} вместо {sa.get('nb_frames')}"))
             if src.cut_frame and abs(float(oa.get("duration") or 0) - src.kept_duration) > 0.6:
-                problems.append("звук: неверная длительность после обрезки")
+                problems.append(L("audio: wrong duration after trimming", "звук: неверная длительность после обрезки"))
     return problems
 
 
@@ -679,14 +718,14 @@ def collect(paths, days=None, match=None):
             if p.lower().endswith(".mp4") and not p.endswith(TMP_SUFFIX):
                 files.append(p)
             else:
-                say(f"Пропуск (поддерживаются только .mp4): {p}")
+                say(L(f"Skipped (only .mp4 is supported): {p}", f"Пропуск (поддерживаются только .mp4): {p}"))
         elif os.path.isdir(p):
             for dp, dn, fn in os.walk(p):
                 for x in fn:
                     if x.lower().endswith(".mp4") and not x.endswith(TMP_SUFFIX):
                         files.append(os.path.join(dp, x))
         else:
-            say(f"Не найдено: {p}")
+            say(L(f"Not found: {p}", f"Не найдено: {p}"))
     if match:
         files = [f for f in files if match.lower() in f.lower()]
     if days:
@@ -721,7 +760,7 @@ def rel_dest(path, roots, out_root):
 # --------------------------------------------------------------------------------------
 def cmd_check(a):
     files = collect(a.paths, a.days, a.match)
-    say(f"Проверяю {len(files)} файлов...")
+    say(L(f"Checking {len(files)} files...", f"Проверяю {len(files)} файлов..."))
     bad = []
     lost = 0.0
     for i, p in enumerate(files):
@@ -735,21 +774,21 @@ def cmd_check(a):
             bad.append(p)
             lost += r["cut_time"]
             status("")
-            say(f"ПОВРЕЖДЁН  {p}\n           первые {r['cut_time']:.1f} с из {r['vdur']:.0f} с перезаписаны, битрейт {r['vmbps']:.0f} Мбит/с")
+            say(L(f"DAMAGED    {p}\n           first {r['cut_time']:.1f} s of {r['vdur']:.0f} s overwritten, bitrate {r['vmbps']:.0f} Mbit/s", f"ПОВРЕЖДЁН  {p}\n           первые {r['cut_time']:.1f} с из {r['vdur']:.0f} с перезаписаны, битрейт {r['vmbps']:.0f} Мбит/с"))
         elif d in ("total", "no-moov", "truncated", "error"):
             bad.append(p)
             status("")
-            what = {"total": "видео испорчено целиком", "no-moov": "файл не дописан (нет индекса)", "truncated": "файл обрезан", "error": "не читается: " + r.get("err", "")}[d]
-            say(f"ПОВРЕЖДЁН  {p}\n           {what}")
+            what = {"total": L("the whole video is damaged", "видео испорчено целиком"), "no-moov": L("the file was not finalised (no index)", "файл не дописан (нет индекса)"), "truncated": L("the file is truncated", "файл обрезан"), "error": L("unreadable: ", "не читается: ") + r.get("err", "")}[d]
+            say(L(f"DAMAGED    {p}\n           {what}", f"ПОВРЕЖДЁН  {p}\n           {what}"))
         elif a.all:
             status("")
-            say(f"ok         {p}" + (f"  ({r['vmbps']:.0f} Мбит/с)" if r.get("vmbps") else ""))
+            say(f"ok         {p}" + (L(f"  ({r['vmbps']:.0f} Mbit/s)", f"  ({r['vmbps']:.0f} Мбит/с)") if r.get("vmbps") else ""))
     status("")
     if bad:
-        say(f"\nПовреждено {len(bad)} из {len(files)}; потеряно начало общей длительностью {hms(lost)}.")
-        say("Обрезка (repair) уберёт испорченное начало без перекодирования, сжатие (compress) - уберёт и сожмёт.")
+        say(L(f"\n{len(bad)} of {len(files)} damaged; total length of the lost heads: {hms(lost)}.", f"\nПовреждено {len(bad)} из {len(files)}; потеряно начало общей длительностью {hms(lost)}."))
+        say(L("Trimming (repair) removes the damaged head without re-encoding; compressing (compress) removes it and compresses.", "Обрезка (repair) уберёт испорченное начало без перекодирования, сжатие (compress) - уберёт и сожмёт."))
     else:
-        say(f"Повреждённых записей нет ({len(files)} файлов проверено).")
+        say(L(f"No damaged recordings ({len(files)} files checked).", f"Повреждённых записей нет ({len(files)} файлов проверено)."))
     return 1 if bad else 0
 
 
@@ -766,7 +805,7 @@ def cmd_estimate(a):
             try:
                 src = Source(p)
             except Exception as ex:
-                say(f"пропуск {os.path.basename(p)}: {ex}")
+                say(L(f"skipped {os.path.basename(p)}: {ex}", f"пропуск {os.path.basename(p)}: {ex}"))
                 continue
             if src.codec != "h264" or src.reason or src.insp["damage"] not in ("none", "n/a"):
                 continue
@@ -774,19 +813,19 @@ def cmd_estimate(a):
             try:
                 res = search_quality(src, a.encoder, a.preset, a.vmaf, a.min_saving, work, a.quality)
             except RuntimeError as ex:
-                say(f"пропуск {os.path.basename(p)}: {ex}")
+                say(L(f"skipped {os.path.basename(p)}: {ex}", f"пропуск {os.path.basename(p)}: {ex}"))
                 continue
             pred = res["pred_size"] if res.get("q") is not None else src.size
             rows.append((src, res, pred))
             tag = f"q={res['q']} VMAF {res['vmaf']:.1f}" if res.get("q") is not None else res["why"]
-            say(f"{len(rows):3}. {src.height}p {src.video_bytes * 8 / src.duration / 1e6:4.0f} Мбит/с  {human(src.size):>9} -> {human(pred):>9} "
-                f"({100 - pred * 100 / src.size:3.0f}%)  {tag}  [{time.time() - t0:.0f} с]  {os.path.basename(p)[:50]}")
+            say(f"{len(rows):3}. {src.height}p {src.video_bytes * 8 / src.duration / 1e6:4.0f} {L('Mbit/s', 'Мбит/с')}  {human(src.size):>9} -> {human(pred):>9} "
+                f"({100 - pred * 100 / src.size:3.0f}%)  {tag}  [{time.time() - t0:.0f} {L('s', 'с')}]  {os.path.basename(p)[:50]}")
     finally:
         shutil.rmtree(work, ignore_errors=True)
     if rows:
         s0 = sum(r[0].size for r in rows)
         s1 = sum(r[2] for r in rows)
-        say(f"\nПо выборке из {len(rows)} файлов: {human(s0)} -> {human(s1)}, экономия {100 - s1 * 100 / s0:.0f}%.")
+        say(L(f"\nSample of {len(rows)} files: {human(s0)} -> {human(s1)}, saving {100 - s1 * 100 / s0:.0f}%.", f"\nПо выборке из {len(rows)} файлов: {human(s0)} -> {human(s1)}, экономия {100 - s1 * 100 / s0:.0f}%."))
     return 0
 
 
@@ -803,7 +842,7 @@ def _batch(a, repair):
     if a.out:
         a.out = os.path.abspath(a.out)
     if not a.replace and not a.out and not a.dry_run:
-        sys.exit("Укажите, куда класть результат: --out ПАПКА (оригиналы не трогаются) или --replace (оригинал заменяется после проверки).")
+        sys.exit(L("Say where to put the result: --out FOLDER (originals are left alone) or --replace (the original is replaced after verification).", "Укажите, куда класть результат: --out ПАПКА (оригиналы не трогаются) или --replace (оригинал заменяется после проверки)."))
     cleanup_tmp(a.paths + ([a.out] if a.out else []))
     done = load_journal()
     todo = []
@@ -820,12 +859,12 @@ def _batch(a, repair):
     if a.limit:
         todo = todo[: a.limit]
     total_bytes = sum(s for _, s in todo)
-    say(f"К обработке: {len(todo)} файлов, {human(total_bytes)} (уже рассмотрено ранее: {len(files) - len(todo)}).")
+    say(L(f"To process: {len(todo)} files, {human(total_bytes)} (already handled earlier: {len(files) - len(todo)}).", f"К обработке: {len(todo)} файлов, {human(total_bytes)} (уже рассмотрено ранее: {len(files) - len(todo)})."))
     if a.dry_run:
         for p, s in todo[:30]:
             say(f"   {human(s):>10}  {p}")
         if len(todo) > 30:
-            say(f"   ... и ещё {len(todo) - 30}")
+            say(L(f"   ... and {len(todo) - 30} more", f"   ... и ещё {len(todo) - 30}"))
         return 0
     work = tempfile.mkdtemp(prefix="nfixer-")
     t_start = time.time()
@@ -834,10 +873,10 @@ def _batch(a, repair):
     try:
         for n, (p, size) in enumerate(todo, 1):
             if a.max_hours and time.time() - t_start > a.max_hours * 3600:
-                say("Достигнут лимит времени (--max-hours), останавливаюсь.")
+                say(L("Time limit reached (--max-hours), stopping.", "Достигнут лимит времени (--max-hours), останавливаюсь."))
                 break
             el = time.time() - t_start
-            eta = f", осталось примерно {hms(el * (total_bytes - stats['seen_bytes']) / stats['seen_bytes'])}" if stats["seen_bytes"] else ""
+            eta = L(f", about {hms(el * (total_bytes - stats['seen_bytes']) / stats['seen_bytes'])} left", f", осталось примерно {hms(el * (total_bytes - stats['seen_bytes']) / stats['seen_bytes'])}") if stats["seen_bytes"] else ""
             say(f"[{n}/{len(todo)}] {p}  ({human(size)}{eta})")
             stats["seen_bytes"] += size
             t0 = time.time()
@@ -845,41 +884,41 @@ def _batch(a, repair):
             try:
                 src = Source(p)
             except Exception as ex:
-                say(f"   пропуск: {ex}")
+                say(L(f"   skipped: {ex}", f"   пропуск: {ex}"))
                 journal(dict(entry, status="error", detail=str(ex)[:300], final=False))
                 stats["failed"] += 1
                 continue
             orig_st = src.st
             dmg = src.insp["damage"]
             if not repair and src.codec != "h264":
-                say(f"   пропуск: видео уже в {src.codec.upper()}")
+                say(L(f"   skipped: the video is already {src.codec.upper()}", f"   пропуск: видео уже в {src.codec.upper()}"))
                 journal(dict(entry, status="skip-codec", detail=src.codec))
                 continue
             if src.reason:
-                say(f"   пропуск: {src.reason}")
+                say(L(f"   skipped: {src.reason}", f"   пропуск: {src.reason}"))
                 journal(dict(entry, status="skip-unsupported", detail=src.reason))
                 continue
             if dmg in ("total", "no-moov", "truncated"):
-                say("   пропуск: файл повреждён так, что целой части не осталось - оставлен как есть")
+                say(L("   skipped: the file is damaged beyond recovery - left as is", "   пропуск: файл повреждён так, что целой части не осталось - оставлен как есть"))
                 journal(dict(entry, status="skip-broken", detail=dmg))
                 continue
             if dmg == "head":
                 if a.damaged == "skip" and not repair:
-                    say(f"   пропуск: начало ({src.insp['cut_time']:.1f} с) испорчено переполнением буфера; используйте --damaged trim")
+                    say(L(f"   skipped: the head ({src.insp['cut_time']:.1f} s) was overwritten by the replay buffer; use --damaged trim", f"   пропуск: начало ({src.insp['cut_time']:.1f} с) испорчено переполнением буфера; используйте --damaged trim"))
                     journal(dict(entry, status="skip-damaged", final=False))
                     continue
                 src.cut_frame, src.cut_time = src.insp["cut_frame"], src.insp["cut_time"]
-                say(f"   начало испорчено: отрезаю первые {src.cut_time:.1f} с (видео там не существует), остаётся {src.kept_duration:.1f} с")
+                say(L(f"   damaged head: cutting the first {src.cut_time:.1f} s (no video exists there), {src.kept_duration:.1f} s remain", f"   начало испорчено: отрезаю первые {src.cut_time:.1f} с (видео там не существует), остаётся {src.kept_duration:.1f} с"))
             elif repair:
                 continue  # чинить нечего
             dest = p if a.replace else rel_dest(p, a.paths, a.out)
             if not a.replace and os.path.exists(dest):
-                say("   пропуск: результат уже есть в папке назначения")
+                say(L("   skipped: the result already exists in the output folder", "   пропуск: результат уже есть в папке назначения"))
                 continue
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             free = shutil.disk_usage(os.path.dirname(dest)).free
             if free < size + 3 * 2**30:
-                say(f"   На диске назначения осталось {human(free)} - этого мало, останавливаюсь.")
+                say(L(f"   Only {human(free)} left on the output drive - not enough, stopping.", f"   На диске назначения осталось {human(free)} - этого мало, останавливаюсь."))
                 break
             tmp = dest + TMP_SUFFIX
             rep = dest + ".rep" + TMP_SUFFIX  # обрезанная копия повреждённого файла - исходник для сжатия
@@ -891,31 +930,31 @@ def _batch(a, repair):
                 else:
                     if src.cut_frame:
                         rc, err = copy_trim(src, rep)
-                        problems = ["ffmpeg завершился с ошибкой: " + err.strip()[-300:]] if rc != 0 else verify_output(src, rep, None, err, trimmed=True)
+                        problems = [L("ffmpeg failed: ", "ffmpeg завершился с ошибкой: ") + err.strip()[-300:]] if rc != 0 else verify_output(src, rep, None, err, trimmed=True)
                         if problems:
-                            raise RuntimeError("не удалось отрезать испорченное начало: " + "; ".join(problems))
+                            raise RuntimeError(L("could not cut the damaged head: ", "не удалось отрезать испорченное начало: ") + "; ".join(problems))
                         src = Source(rep)  # дальше работаем с чистой копией: любые ошибки декодирования теперь настоящие
                         if src.reason or src.insp["damage"] != "none":
-                            raise RuntimeError("обрезанная копия не прошла проверку")
+                            raise RuntimeError(L("the trimmed copy failed verification", "обрезанная копия не прошла проверку"))
                     info = search_quality(src, a.encoder, a.preset, a.vmaf, a.min_saving, work, a.quality, orig_size=size)
                     if info.get("q") is None:
-                        say(f"   оставлен как есть: {info['why']}")
+                        say(L(f"   left as is: {info['why']}", f"   оставлен как есть: {info['why']}"))
                         journal(dict(entry, status="kept", detail=info["why"], tries=info.get("tries")))
                         stats["kept"] += 1
                         continue
-                    say(f"   качество q={info['q']}: VMAF {info['vmaf']:.1f} на пробах, прогноз {human(info['pred_size'])}")
+                    say(L(f"   quality q={info['q']}: VMAF {info['vmaf']:.1f} on samples, predicted size {human(info['pred_size'])}", f"   качество q={info['q']}: VMAF {info['vmaf']:.1f} на пробах, прогноз {human(info['pred_size'])}"))
                     note = f"NFixer {VERSION}: {a.encoder} q={info['q']} vmaf={info['vmaf']} src=h264 {size} bytes"
                     if cut_time:
                         note += f", cut {cut_time:.1f}s damaged head"
                     rc, err = full_encode(src, a.encoder, a.preset, info["q"], tmp, note)
                     want = ENCODERS[a.encoder][3]
                 if rc != 0:
-                    raise RuntimeError("ffmpeg завершился с ошибкой: " + err.strip()[-300:])
+                    raise RuntimeError(L("ffmpeg failed: ", "ffmpeg завершился с ошибкой: ") + err.strip()[-300:])
                 problems = verify_output(src, tmp, want, err, trimmed=repair)
                 out_size = os.path.getsize(tmp)
                 if not repair and not problems and out_size > size * (1 - a.min_saving):
                     os.remove(tmp)
-                    say(f"   оставлен как есть: результат {human(out_size)} - выигрыш меньше {a.min_saving * 100:.0f}%")
+                    say(L(f"   left as is: the result is {human(out_size)} - saving below {a.min_saving * 100:.0f}%", f"   оставлен как есть: результат {human(out_size)} - выигрыш меньше {a.min_saving * 100:.0f}%"))
                     journal(dict(entry, status="kept", detail="not smaller", out_size=out_size, q=info["q"]))
                     stats["kept"] += 1
                     continue
@@ -923,12 +962,15 @@ def _batch(a, repair):
                 if not repair and not problems:
                     # контрольный замер на готовом файле в другом месте ролика
                     sw = src.windows([0.37] if src.duration < 600 else [0.12, 0.63, 0.91])
-                    spot = measure_vmaf(tmp, sw, src, sw, work)
-                    if not (spot["mean"] >= a.vmaf - 2 and spot["p5"] >= a.vmaf - 8):
-                        problems.append(f"контрольный замер качества не пройден (VMAF {spot['mean']:.1f}, 5%: {spot['p5']:.1f})")
+                    shift = video_start(tmp) - src.start  # у результата первый кадр может стоять на другой отметке времени
+                    spot = measure_vmaf(tmp, [(max(0.0, t + shift), d) for t, d in sw], src, sw, work)
+                    # Это страховка от грубого брака, а не второй подбор качества: планку держит подбор на пробах,
+                    # здесь допуск шире, иначе клип с одной трудной сценой отклонялся бы снова и снова.
+                    if not (spot["mean"] >= a.vmaf - 2 and spot["p5"] >= a.vmaf - 12):
+                        problems.append(L(f"quality spot check failed (VMAF {spot['mean']:.1f}, 5%: {spot['p5']:.1f})", f"контрольный замер качества не пройден (VMAF {spot['mean']:.1f}, 5%: {spot['p5']:.1f})"))
                 if problems:
                     os.remove(tmp)
-                    say("   ОШИБКА ПРОВЕРКИ, оригинал не тронут: " + "; ".join(problems))
+                    say(L("   VERIFICATION ERROR, original untouched: ", "   ОШИБКА ПРОВЕРКИ, оригинал не тронут: ") + "; ".join(problems))
                     journal(dict(entry, status="verify-failed", detail="; ".join(problems)[:500], final=False))
                     stats["failed"] += 1
                     continue
@@ -941,12 +983,12 @@ def _batch(a, repair):
                 stats["done"] += 1
                 stats["in"] += size
                 stats["out"] += out_size
-                extra = f", контроль VMAF {spot['mean']:.1f}" if spot else ""
-                say(f"   готово: {human(size)} -> {human(out_size)} (-{100 - out_size * 100 / size:.0f}%){extra}, {hms(time.time() - t0)}")
+                extra = L(f", spot-check VMAF {spot['mean']:.1f}", f", контроль VMAF {spot['mean']:.1f}") if spot else ""
+                say(L(f"   done: {human(size)} -> {human(out_size)} (-{100 - out_size * 100 / size:.0f}%){extra}, {hms(time.time() - t0)}", f"   готово: {human(size)} -> {human(out_size)} (-{100 - out_size * 100 / size:.0f}%){extra}, {hms(time.time() - t0)}"))
             except RuntimeError as ex:
                 if tmp and os.path.exists(tmp):
                     os.remove(tmp)
-                say(f"   ОШИБКА, оригинал не тронут: {ex}")
+                say(L(f"   ERROR, original untouched: {ex}", f"   ОШИБКА, оригинал не тронут: {ex}"))
                 journal(dict(entry, status="error", detail=str(ex)[:500], final=False))
                 stats["failed"] += 1
             finally:
@@ -957,7 +999,7 @@ def _batch(a, repair):
                     pass
     except KeyboardInterrupt:
         status("")
-        say("\nОстановлено пользователем. Незавершённый файл удалён, оригинал цел; при следующем запуске работа продолжится.")
+        say(L("\nStopped by the user. The unfinished file was removed, the original is intact; the next run will continue.", "\nОстановлено пользователем. Незавершённый файл удалён, оригинал цел; при следующем запуске работа продолжится."))
         if _current_proc:
             try:
                 _current_proc.wait(timeout=15)
@@ -970,10 +1012,10 @@ def _batch(a, repair):
                 pass
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    say(f"\nИтог: обработано {stats['done']}, оставлено как есть {stats['kept']}, ошибок {stats['failed']}, время {hms(time.time() - t_start)}.")
+    say(L(f"\nSummary: {stats['done']} processed, {stats['kept']} left as is, {stats['failed']} errors, time {hms(time.time() - t_start)}.", f"\nИтог: обработано {stats['done']}, оставлено как есть {stats['kept']}, ошибок {stats['failed']}, время {hms(time.time() - t_start)}."))
     if stats["done"]:
-        say(f"Было {human(stats['in'])}, стало {human(stats['out'])} - освобождено {human(stats['in'] - stats['out'])} ({100 - stats['out'] * 100 / stats['in']:.0f}%).")
-    say(f"Журнал: {JOURNAL}")
+        say(L(f"Was {human(stats['in'])}, now {human(stats['out'])} - freed {human(stats['in'] - stats['out'])} ({100 - stats['out'] * 100 / stats['in']:.0f}%).", f"Было {human(stats['in'])}, стало {human(stats['out'])} - освобождено {human(stats['in'] - stats['out'])} ({100 - stats['out'] * 100 / stats['in']:.0f}%)."))
+    say(L(f"Journal: {JOURNAL}", f"Журнал: {JOURNAL}"))
     return 0 if not stats["failed"] else 2
 
 
@@ -983,51 +1025,55 @@ def main():
             s.reconfigure(errors="replace")
         except Exception:
             pass
-    ap = argparse.ArgumentParser(prog="nfixer", description="Сжатие игровых записей без видимой потери качества и поиск записей, испорченных Instant Replay.")
-    ap.add_argument("--ffmpeg", help="папка с ffmpeg.exe и ffprobe.exe")
+    global LANG
+    LANG = detect_lang(sys.argv[1:])
+    ap = argparse.ArgumentParser(prog="nfixer", description=L("Compress game recordings without visible quality loss and find recordings damaged by Instant Replay.", "Сжатие игровых записей без видимой потери качества и поиск записей, испорченных Instant Replay."))
+    ap.add_argument("--lang", choices=["en", "ru"], help=L("message language: en (default) or ru; the NFIXER_LANG variable works too",
+                                                              "язык сообщений: en (по умолчанию) или ru; можно задать и переменной NFIXER_LANG"))
+    ap.add_argument("--ffmpeg", help=L("folder with ffmpeg.exe and ffprobe.exe", "папка с ffmpeg.exe и ffprobe.exe"))
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
-        p.add_argument("paths", nargs="*", help="папки и/или файлы")
-        p.add_argument("--list", help="текстовый файл (UTF-8) со списком папок и файлов, по одному пути в строке")
-        p.add_argument("--days", type=float, help="только файлы, изменённые за последние N дней")
-        p.add_argument("--match", help="только файлы, в пути которых есть эта строка")
+        p.add_argument("paths", nargs="*", help=L("folders and/or files", "папки и/или файлы"))
+        p.add_argument("--list", help=L("text file (UTF-8) listing folders and files, one path per line", "текстовый файл (UTF-8) со списком папок и файлов, по одному пути в строке"))
+        p.add_argument("--days", type=float, help=L("only files modified within the last N days", "только файлы, изменённые за последние N дней"))
+        p.add_argument("--match", help=L("only files whose path contains this string", "только файлы, в пути которых есть эта строка"))
 
     def quality(p):
-        p.add_argument("--encoder", choices=list(ENCODERS), default="nvenc", help="; ".join(f"{k}: {v[4]}" for k, v in ENCODERS.items()))
-        p.add_argument("--preset", help="пресет кодировщика (nvenc: p1..p7, x265: fast/medium/slow)")
-        p.add_argument("--vmaf", type=float, default=95.0, help="планка качества VMAF относительно оригинала (по умолчанию 95 - визуально неотличимо)")
-        p.add_argument("--quality", type=int, help="задать параметр качества вручную вместо автоподбора")
-        p.add_argument("--min-saving", type=float, default=0.15, help="минимальный выигрыш, ради которого стоит трогать файл (0.15 = 15%%)")
+        p.add_argument("--encoder", choices=list(ENCODERS), default="nvenc", help="; ".join(f"{k}: {L(*v[4])}" for k, v in ENCODERS.items()))
+        p.add_argument("--preset", help=L("encoder preset (nvenc: p1..p7, x265: fast/medium/slow)", "пресет кодировщика (nvenc: p1..p7, x265: fast/medium/slow)"))
+        p.add_argument("--vmaf", type=float, default=95.0, help=L("VMAF quality target against the original (default 95 - visually indistinguishable)", "планка качества VMAF относительно оригинала (по умолчанию 95 - визуально неотличимо)"))
+        p.add_argument("--quality", type=int, help=L("set the quality parameter by hand instead of searching for it", "задать параметр качества вручную вместо автоподбора"))
+        p.add_argument("--min-saving", type=float, default=0.15, help=L("minimum saving that justifies touching a file (0.15 = 15%%)", "минимальный выигрыш, ради которого стоит трогать файл (0.15 = 15%%)"))
 
     def batch(p):
-        p.add_argument("--replace", action="store_true", help="после успешной проверки заменить оригинал результатом (оригинал удаляется)")
-        p.add_argument("--out", help="папка для результатов; оригиналы остаются на месте")
-        p.add_argument("--limit", type=int, help="обработать не больше N файлов")
-        p.add_argument("--max-hours", type=float, help="остановиться через N часов")
-        p.add_argument("--retry", action="store_true", help="заново попробовать файлы, которые раньше были оставлены как есть")
-        p.add_argument("--dry-run", action="store_true", help="только показать, что будет обработано")
+        p.add_argument("--replace", action="store_true", help=L("after successful verification replace the original with the result (the original is deleted)", "после успешной проверки заменить оригинал результатом (оригинал удаляется)"))
+        p.add_argument("--out", help=L("output folder; originals stay in place", "папка для результатов; оригиналы остаются на месте"))
+        p.add_argument("--limit", type=int, help=L("process at most N files", "обработать не больше N файлов"))
+        p.add_argument("--max-hours", type=float, help=L("stop after N hours", "остановиться через N часов"))
+        p.add_argument("--retry", action="store_true", help=L("retry files that were left as is before", "заново попробовать файлы, которые раньше были оставлены как есть"))
+        p.add_argument("--dry-run", action="store_true", help=L("only show what would be processed", "только показать, что будет обработано"))
 
-    p = sub.add_parser("check", help="найти повреждённые записи")
+    p = sub.add_parser("check", help=L("find damaged recordings", "найти повреждённые записи"))
     common(p)
-    p.add_argument("--all", action="store_true", help="показывать и исправные файлы")
+    p.add_argument("--all", action="store_true", help=L("also list intact files", "показывать и исправные файлы"))
     p.set_defaults(fn=cmd_check)
 
-    p = sub.add_parser("estimate", help="оценить экономию на случайной выборке")
+    p = sub.add_parser("estimate", help=L("estimate the saving on a random sample", "оценить экономию на случайной выборке"))
     common(p)
     quality(p)
-    p.add_argument("--files", type=int, default=12, help="сколько файлов взять")
+    p.add_argument("--files", type=int, default=12, help=L("how many files to sample", "сколько файлов взять"))
     p.add_argument("--seed", type=int, default=1)
     p.set_defaults(fn=cmd_estimate)
 
-    p = sub.add_parser("compress", help="сжать записи")
+    p = sub.add_parser("compress", help=L("compress recordings", "сжать записи"))
     common(p)
     quality(p)
     batch(p)
-    p.add_argument("--damaged", choices=["trim", "skip"], default="trim", help="что делать с записями, у которых испорчено начало: отрезать его (trim) или не трогать файл (skip)")
+    p.add_argument("--damaged", choices=["trim", "skip"], default="trim", help=L("what to do with recordings whose head is damaged: cut it (trim) or leave the file alone (skip)", "что делать с записями, у которых испорчено начало: отрезать его (trim) или не трогать файл (skip)"))
     p.set_defaults(fn=cmd_compress)
 
-    p = sub.add_parser("repair", help="отрезать испорченное начало без перекодирования")
+    p = sub.add_parser("repair", help=L("cut the damaged head without re-encoding", "отрезать испорченное начало без перекодирования"))
     common(p)
     batch(p)
     p.set_defaults(fn=cmd_repair, encoder=None, preset=None, vmaf=0, quality=None, min_saving=0, damaged="trim")
@@ -1037,14 +1083,14 @@ def main():
         with open(a.list, encoding="utf-8-sig") as fh:
             a.paths += [ln.strip() for ln in fh if ln.strip()]
     if not a.paths:
-        ap.error("не указаны папки или файлы")
+        ap.error(L("no folders or files given", "не указаны папки или файлы"))
     if a.cmd != "check":
         find_ffmpeg(a.ffmpeg)
     try:
         sys.exit(a.fn(a))
     except KeyboardInterrupt:
         status("")
-        say("\nОстановлено.")
+        say(L("\nStopped.", "\nОстановлено."))
         sys.exit(130)
 
 
