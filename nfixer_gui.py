@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -133,6 +134,12 @@ class App(tk.Tk):
         self.days = tk.StringVar(value=cfg.get("days", ""))
         self.hours = tk.StringVar(value=cfg.get("hours", ""))
         self.state_text = tk.StringVar()
+        self.eta_text = tk.StringVar()
+        self.eta = None  # прогноз времени от nfixer.py: (когда получен, секунд на файл, секунд на весь остаток)
+        self.retry_paths = []  # файлы, не прошедшие проверку качества в последнем запуске
+        self.problem_count = 0
+        self.last_cmd = None
+        self.onlyfile = None
         self.body = None
         self.items = self._clean(list(initial) or cfg.get("items", []))[0]
         self._build()
@@ -245,6 +252,7 @@ class App(tk.Tk):
         self.bar = ttk.Progressbar(f, maximum=100, value=old_bar)
         self.bar.grid(row=0, column=0, sticky="ew")
         ttk.Label(f, textvariable=self.state_text, anchor="w").grid(row=1, column=0, sticky="ew", pady=(3, 0))
+        ttk.Label(f, textvariable=self.eta_text, anchor="w", foreground="#1a4fa0").grid(row=2, column=0, sticky="ew", pady=(2, 0))
         self.state_text.set(T("Ready", "Готов к работе"))
 
         f = ttk.Frame(body)
@@ -289,9 +297,9 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------------- список файлов и папок
     def _clean(self, paths, have=()):
-        """Оставить папки и файлы .mp4, убрать повторы. Возвращает (годные пути, число пропущенных)."""
+        """Оставить папки и файлы .mp4, убрать повторы. Возвращает (годные пути, отвергнутые пути)."""
         seen = {os.path.normcase(x) for x in have}
-        good, skipped = [], 0
+        good, skipped = [], []
         for raw in paths:
             p = os.path.normpath(str(raw).strip().strip('"'))
             if not p or p == ".":
@@ -301,20 +309,26 @@ class App(tk.Tk):
                     seen.add(os.path.normcase(p))
                     good.append(p)
             else:
-                skipped += 1
+                skipped.append(p)
         return good, skipped
 
-    def add_paths(self, paths):
-        """Добавить в список папки и файлы .mp4; остальное пропустить. Возвращает (добавлено, пропущено)."""
+    def add_paths(self, paths, quiet=False):
+        """Добавить в список папки и файлы .mp4; остальное не брать и объяснить почему. Возвращает (добавлено, пропущено)."""
         good, skipped = self._clean(paths, self.items)
         for p in good:
             self.items.append(p)
             self.lb.insert("end", p)
         msg = T(f"Added: {len(good)}", f"Добавлено: {len(good)}")
         if skipped:
-            msg += T(f", skipped (not .mp4 or not found): {skipped}", f", пропущено (не .mp4 или не найдено): {skipped}")
+            msg += T(f", not accepted: {len(skipped)}", f", не принято: {len(skipped)}")
         self.state_text.set(msg + T(f". In the list: {len(self.items)}", f". Всего в списке: {len(self.items)}"))
-        return len(good), skipped
+        if skipped and not quiet:
+            rows = [("- " + os.path.basename(p) + ("" if os.path.exists(p) else T("  (not found)", "  (не найден)"))) for p in skipped[:8]]
+            if len(skipped) > 8:
+                rows.append(T(f"... and {len(skipped) - 8} more", f"... и ещё {len(skipped) - 8}"))
+            messagebox.showwarning(APP, T("These files were not added: NFixer works only with .mp4 recordings.\n\n",
+                                          "Эти файлы не добавлены: NFixer работает только с записями .mp4.\n\n") + "\n".join(rows))
+        return len(good), len(skipped)
 
     def _poll_drop(self):
         try:
@@ -368,7 +382,8 @@ class App(tk.Tk):
     @staticmethod
     def _tag(line):
         """Цвет строки журнала. Признаки ищутся на обоих языках: журнал мог быть написан до смены языка."""
-        if any(w in line for w in ("ERROR", "ОШИБКА", "DAMAGED", "ПОВРЕЖДЁН", "Traceback")):
+        if any(w in line for w in ("ERROR", "ОШИБКА", "DAMAGED", "ПОВРЕЖДЁН", "Traceback", "FAILED", "НЕ ПРОЙДЕНА", "PROBLEM FILES", "ПРОБЛЕМНЫЕ ФАЙЛЫ")) \
+                or line.lstrip().startswith("! "):
             return "bad"
         if any(w in line for w in ("done:", "готово:")) or line.startswith(("Was ", "Было ")):
             return "good"
@@ -457,16 +472,29 @@ class App(tk.Tk):
                        "но вернуть исходный файл после этого будет нельзя.\n\nПродолжить?"), icon="warning", default="no"):
             return
         self._save_cfg()
+        self._launch(cmd)
+
+    def _launch(self, cmd, only=None):
+        """Запустить nfixer.py. only - список файлов для повтора на ступень качественнее (остальное из списка не трогается)."""
         # пути передаются списком в файле: при перетаскивании сотен видео командная строка была бы слишком длинной
         fd, self.listfile = tempfile.mkstemp(prefix="nfixer-list-", suffix=".txt")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write("\n".join(self.items))
+        extra = []
+        if only:
+            fd, self.onlyfile = tempfile.mkstemp(prefix="nfixer-only-", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(only))
+            extra = ["--better", "--only", self.onlyfile]
         py = os.path.join(os.path.dirname(sys.executable), "python.exe")
         if not os.path.isfile(py):
             py = sys.executable
         env = dict(os.environ, PYTHONIOENCODING="utf-8", NFIXER_GUI="1")
         self.stopped = False
-        self.proc = subprocess.Popen([py, "-u", "-X", "utf8", os.path.join(HERE, "nfixer.py"), "--lang", nfixer.LANG, cmd[0], "--list", self.listfile] + cmd[1:],
+        self.last_cmd = cmd
+        self.retry_paths, self.problem_count, self.eta = [], 0, None
+        self.eta_text.set("")
+        self.proc = subprocess.Popen([py, "-u", "-X", "utf8", os.path.join(HERE, "nfixer.py"), "--lang", nfixer.LANG, cmd[0], "--list", self.listfile] + cmd[1:] + extra,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, cwd=HERE, creationflags=NO_WINDOW)
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
         self.b_start.configure(state="disabled")
@@ -474,9 +502,25 @@ class App(tk.Tk):
         self.bar.configure(value=0)
         self.state_text.set(T("Working...", "Работаю..."))
         title = dict((a[0], a[1]) for a in actions())[cmd[0]]
-        self._write(T(f"=== {title}: {len(self.items)} item(s) in the list ===", f"=== {title}: объектов в списке - {len(self.items)} ==="), "head")
+        if only:
+            self._write(T(f"=== {title}, one step higher quality: {len(only)} file(s) ===", f"=== {title}, на ступень качественнее: файлов - {len(only)} ==="), "head")
+        else:
+            self._write(T(f"=== {title}: {len(self.items)} item(s) in the list ===", f"=== {title}: объектов в списке - {len(self.items)} ==="), "head")
         self._sync()
         self.after(100, self._poll)
+        self.after(500, self._tick)
+
+    def _tick(self):
+        """Раз в полсекунды обновлять обратный отсчёт: сколько осталось на текущий файл и на всю работу."""
+        if not self.proc:
+            return
+        if self.eta:
+            got, one, rest = self.eta
+            el = time.time() - got
+            left = lambda s: nfixer.hms(s - el) if s - el >= 1 else T("almost done", "вот-вот")
+            self.eta_text.set(T(f"This file: about {nfixer.hms(one)}, left {left(one)}      Whole job: left about {left(rest)}",
+                                f"Этот файл: около {nfixer.hms(one)}, осталось {left(one)}      Вся работа: осталось около {left(rest)}"))
+        self.after(500, self._tick)
 
     def _reader(self, proc):
         for raw in proc.stdout:
@@ -498,6 +542,16 @@ class App(tk.Tk):
             self.after(100, self._poll)
 
     def _handle(self, line):
+        if line.startswith(("@@#", "@@!")):  # служебные строки: прогноз времени и итоговый список проблемных файлов
+            try:
+                d = json.loads(line[3:])
+            except ValueError:
+                return
+            if line[2] == "#":
+                self.eta = (time.time() - d.get("spent", 0), d.get("file", 0), d.get("all", 0))
+            else:
+                self.retry_paths, self.problem_count = list(d.get("retry", [])), int(d.get("problems", 0))
+            return
         if line.startswith("@@"):
             msg = line[2:]
             self.state_text.set(msg)
@@ -521,6 +575,14 @@ class App(tk.Tk):
             except OSError:
                 pass
             self.listfile = None
+        if self.onlyfile:
+            try:
+                os.remove(self.onlyfile)
+            except OSError:
+                pass
+            self.onlyfile = None
+        self.eta = None
+        self.eta_text.set("")
         self.b_start.configure(state="normal")
         self.b_stop.configure(state="disabled")
         if self.stopped:
@@ -530,8 +592,24 @@ class App(tk.Tk):
                           "Остановлено. Оригиналы целы" + (", недописанный файл удалён." if removed else ".") + " Повторный запуск продолжит с места остановки."), "head")
         else:
             self.bar.configure(value=100)
-            self.state_text.set(T("Finished", "Готово"))
+            self.state_text.set(T("Finished", "Готово") + (T(f" - problem files: {self.problem_count} (listed at the end of the log)",
+                                                              f" - проблемных файлов: {self.problem_count} (перечислены в конце журнала)") if self.problem_count else ""))
         self._sync()
+        if not self.stopped and self.retry_paths and self.last_cmd:
+            self.after(50, self._offer_retry)
+
+    def _offer_retry(self):
+        """Файлы, не прошедшие проверку качества, были пропущены. Решение о повторе - за пользователем."""
+        paths = self.retry_paths
+        rows = ["- " + os.path.basename(p) for p in paths[:10]]
+        if len(paths) > 10:
+            rows.append(T(f"... and {len(paths) - 10} more", f"... и ещё {len(paths) - 10}"))
+        if messagebox.askyesno(APP, T(f"{len(paths)} file(s) did not pass the quality check after compression and were skipped (the originals are untouched):\n\n",
+                                      f"Файлов, не прошедших проверку качества после сжатия: {len(paths)}. Они пропущены, оригиналы не тронуты:\n\n")
+                               + "\n".join(rows)
+                               + T("\n\nCompress them again one step higher quality?\nThe files will come out somewhat larger; the other settings stay the same.",
+                                   "\n\nСжать их ещё раз на ступень качественнее?\nФайлы выйдут немного крупнее; остальные настройки те же.")):
+            self._launch(self.last_cmd, only=paths)
 
     def _cleanup(self):
         """После принудительной остановки убрать недописанные временные файлы (только свои, *.nfixer-tmp.mp4)."""

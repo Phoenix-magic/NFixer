@@ -19,8 +19,15 @@ with an HEVC encoder by default; without one, use `--encoder x265`.
 Double-click `NFixer.pyw`. Add `.mp4` videos and folders with the buttons or by dragging them from Explorer into
 the window (several at once is fine; they can also be dropped onto `NFixer.pyw` or its shortcut). Then pick an
 action (check / estimate saving / compress / cut damaged head), where the result goes, and the quality.
-There are Start and Stop buttons, a progress bar and a log. The language (English / Русский) is switched in the
-top right corner; English is the default.
+There are Start and Stop buttons, a progress bar and a log. Under the progress bar the window shows the expected
+time for the current file and for the whole job; the forecast is rough at first and is refined as files are
+processed. The language (English / Русский) is switched in the top right corner; English is the default.
+
+NFixer always goes through the whole list. A file that cannot be processed is skipped, and all such files are
+listed at the end of the log with the reason: not an `.mp4`, a broken file or not a video, a recording that
+cannot be compressed without visible loss even at the highest quality setting, a processing error. If a file was
+compressed but failed the final quality check, the result is discarded, the original stays, and when the job is
+over NFixer asks whether to compress those files again one step higher quality - the decision is yours.
 
 Stop interrupts the job at once: the unfinished file is removed, the original stays, and the next Start continues
 where it left off. Do not run two copies on the same folders at the same time.
@@ -37,7 +44,8 @@ nfixer repair   PATHS... --out FOLDER       cut the damaged head without re-enco
 
 `PATHS` is any number of folders and `.mp4` files; a long list can be passed as a file: `--list list.txt`.
 Useful options: `--days N` (recent files only), `--match TEXT` (filter by path), `--limit N`, `--max-hours N`,
-`--vmaf N`, `--dry-run`. A job can be interrupted with Ctrl+C and started again - it continues where it stopped.
+`--vmaf N`, `--dry-run`, `--better` (files that failed the quality check last time are compressed one step
+higher quality; in an interactive console NFixer offers this itself at the end). A job can be interrupted with Ctrl+C and started again - it continues where it stopped.
 Messages are in English by default; `--lang ru` (before the command) or `NFIXER_LANG=ru` switches to Russian.
 
 Example: check the recordings of the last day.
