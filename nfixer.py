@@ -898,6 +898,27 @@ BROKEN_WHY = {
 }
 
 
+UNCHANGED_STATUSES = ("kept", "skip-codec", "skip-unsupported")  # исправные видео, которые остались как были
+
+
+def verdict(a):
+    """Настройки, от которых зависит решение «оставить как есть»: с другими настройками файл надо рассмотреть заново."""
+    return {"target": a.vmaf, "encoder": a.encoder, "min_saving": a.min_saving, "fixed_q": a.quality}
+
+
+def same_verdict(e, a, repair):
+    """Годится ли прошлое решение по файлу для нынешнего запуска."""
+    if e.get("status") not in ("kept", "skip-codec"):
+        return True  # сломанный файл или неподдерживаемый формат остаются такими при любых настройках
+    if repair:
+        return False  # решение сжатия ничего не говорит о том, есть ли что обрезать
+    if e.get("status") == "skip-codec":
+        return True
+    # в записях старых версий настроек нет - тогда это были настройки по умолчанию
+    return (e.get("target", 95.0) == a.vmaf and e.get("encoder", "nvenc") == a.encoder
+            and abs(e.get("min_saving", 0.15) - a.min_saving) < 1e-9 and e.get("fixed_q") == a.quality)
+
+
 def cmd_compress(a):
     return _batch(a, repair=False)
 
@@ -926,21 +947,27 @@ def _batch(a, repair, only=None):
         sys.exit(L("Say where to put the result: --out FOLDER (originals are left alone) or --replace (the original is replaced after verification).", "Укажите, куда класть результат: --out ПАПКА (оригиналы не трогаются) или --replace (оригинал заменяется после проверки)."))
     cleanup_tmp(a.paths + ([a.out] if a.out else []))
     done = load_journal()
+    copy_kept = bool(getattr(a, "copy_kept", False) and a.out and not a.replace)
     todo = []
+    copy_only = []  # рассмотренные раньше и оставленные без изменений - их нужно только скопировать
     for p in files:
         e = done.get(p.lower())
         try:
             st = os.stat(p)
         except OSError:
             continue
-        if e and not a.retry and e.get("size") == st.st_size and e.get("mtime_ns") == st.st_mtime_ns and e.get("final"):
-            continue  # этот файл в таком виде уже рассматривали (сжат или оставлен как есть)
+        if e and not a.retry and e.get("size") == st.st_size and e.get("mtime_ns") == st.st_mtime_ns and e.get("final") and same_verdict(e, a, repair):
+            if copy_kept and e.get("status") in UNCHANGED_STATUSES:
+                copy_only.append(p)
+            continue  # этот файл в таком виде и с такими настройками уже рассматривали
         todo.append((p, st.st_size))
     todo.sort(key=lambda x: -x[1])
     if a.limit:
         todo = todo[: a.limit]
     total_bytes = sum(s for _, s in todo)
     say(L(f"To process: {len(todo)} files, {human(total_bytes)} (already handled earlier: {len(files) - len(todo)}).", f"К обработке: {len(todo)} файлов, {human(total_bytes)} (уже рассмотрено ранее: {len(files) - len(todo)})."))
+    if copy_only:
+        say(L(f"Left unchanged earlier and to be copied to the output folder as is: {len(copy_only)}.", f"Оставлены без изменений раньше и будут скопированы в папку результатов как есть: {len(copy_only)}."))
     if a.dry_run:
         for p, s in todo[:30]:
             say(f"   {human(s):>10}  {p}")
@@ -962,18 +989,71 @@ def _batch(a, repair, only=None):
     gui = bool(os.environ.get("NFIXER_GUI"))
     work = tempfile.mkdtemp(prefix="nfixer-")
     t_start = time.time()
-    stats = {"done": 0, "in": 0, "out": 0, "kept": 0, "failed": 0}
+    stats = {"done": 0, "in": 0, "out": 0, "kept": 0, "failed": 0, "copied": 0, "copied_bytes": 0}
     spent = planned = 0.0  # фактическое и прогнозное время уже пройденных файлов - для поправки прогноза
     prev = None
     tmp = None
+    halted = False
 
     def problem(path, kind, detail, **extra):
         problems.append(dict(extra, path=path, kind=kind, detail=detail))
+
+    def place_unchanged(p, src=None, trimmed=None):
+        """--copy-kept: положить в папку результатов файл, который не сжимался, чтобы там был полный набор.
+
+        У записи с испорченным началом копируется обрезанная версия (trimmed - уже готовая обрезанная копия, если есть):
+        испорченная часть не нужна никому. Ошибка копирования не останавливает работу, а попадает в список проблем.
+        """
+        nonlocal tmp
+        if not copy_kept:
+            return
+        dest = rel_dest(p, a.paths, a.out)
+        if os.path.exists(dest):
+            return
+        try:
+            orig_st = os.stat(p)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            free = shutil.disk_usage(os.path.dirname(dest)).free
+            if free < orig_st.st_size + 3 * 2**30:
+                raise OSError(L(f"only {human(free)} left on the output drive", f"на диске назначения осталось только {human(free)}"))
+            tmp = dest + TMP_SUFFIX
+            if trimmed and os.path.exists(trimmed):
+                os.replace(trimmed, tmp)
+                how = L("with the damaged head cut off", "с отрезанным испорченным началом")
+            else:
+                if src is None:
+                    src = Source(p)
+                dmg = src.insp.get("damage")
+                if dmg == "head" and a.damaged == "trim":
+                    src.cut_frame, src.cut_time = src.insp["cut_frame"], src.insp["cut_time"]
+                    rc, err = copy_trim(src, tmp)
+                    bad = [err.strip()[-300:]] if rc != 0 else verify_output(src, tmp, None, err, trimmed=True)
+                    if bad:
+                        raise OSError(L("could not cut the damaged head: ", "не удалось отрезать испорченное начало: ") + "; ".join(bad))
+                    how = L("with the damaged head cut off", "с отрезанным испорченным началом")
+                else:
+                    status(L(f"   copying {os.path.basename(p)}", f"   копирую {os.path.basename(p)}"))
+                    shutil.copyfile(p, tmp)
+                    status("")
+                    how = L("as is", "как есть")
+            os.replace(tmp, dest)
+            tmp = None
+            set_file_times(dest, orig_st)
+            stats["copied"] += 1
+            stats["copied_bytes"] += os.path.getsize(dest)
+            say(L(f"   copied to the output folder {how}", f"   скопирован в папку результатов {how}"))
+        except (OSError, RuntimeError) as ex:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+            tmp = None
+            say(L(f"   ERROR while copying to the output folder: {ex}", f"   ОШИБКА при копировании в папку результатов: {ex}"))
+            problem(p, "error", L("not copied to the output folder: ", "не скопирован в папку результатов: ") + str(ex)[:300])
 
     try:
         for n, (p, size) in enumerate(todo, 1):
             if a.max_hours and time.time() - t_start > a.max_hours * 3600:
                 say(L("Time limit reached (--max-hours), stopping.", "Достигнут лимит времени (--max-hours), останавливаюсь."))
+                halted = True
                 break
             if prev:
                 spent += time.time() - prev[0]
@@ -1014,11 +1094,13 @@ def _batch(a, repair, only=None):
             if not repair and src.codec != "h264":
                 say(L(f"   skipped: the video is already {src.codec.upper()}", f"   пропуск: видео уже в {src.codec.upper()}"))
                 journal(dict(entry, status="skip-codec", detail=src.codec))
+                place_unchanged(p, src)
                 continue
             if src.reason:
                 say(L(f"   skipped: {src.reason}", f"   пропуск: {src.reason}"))
                 journal(dict(entry, status="skip-unsupported", detail=src.reason))
                 problem(p, "unsupported", src.reason)
+                place_unchanged(p, src)
                 continue
             if dmg in ("total", "no-moov", "truncated"):
                 why = L(*BROKEN_WHY[dmg])
@@ -1032,11 +1114,13 @@ def _batch(a, repair, only=None):
                 if a.damaged == "skip" and not repair:
                     say(L(f"   skipped: the head ({src.insp['cut_time']:.1f} s) was overwritten by the replay buffer; use --damaged trim", f"   пропуск: начало ({src.insp['cut_time']:.1f} с) испорчено переполнением буфера; используйте --damaged trim"))
                     journal(dict(entry, status="skip-damaged", final=False))
+                    place_unchanged(p, src)
                     continue
                 src.cut_frame, src.cut_time = src.insp["cut_frame"], src.insp["cut_time"]
                 say(L(f"   damaged head: cutting the first {src.cut_time:.1f} s (no video exists there), {src.kept_duration:.1f} s remain", f"   начало испорчено: отрезаю первые {src.cut_time:.1f} с (видео там не существует), остаётся {src.kept_duration:.1f} с"))
             elif repair:
                 say(L("   intact - nothing to cut", "   запись цела - обрезать нечего"))
+                place_unchanged(p, src)
                 continue
             dest = p if a.replace else rel_dest(p, a.paths, a.out)
             if not a.replace and os.path.exists(dest):
@@ -1046,6 +1130,7 @@ def _batch(a, repair, only=None):
             free = shutil.disk_usage(os.path.dirname(dest)).free
             if free < size + 3 * 2**30:
                 say(L(f"   Only {human(free)} left on the output drive - not enough, stopping.", f"   На диске назначения осталось {human(free)} - этого мало, останавливаюсь."))
+                halted = True
                 break
             tmp = dest + TMP_SUFFIX
             rep = dest + ".rep" + TMP_SUFFIX  # обрезанная копия повреждённого файла - исходник для сжатия
@@ -1071,10 +1156,11 @@ def _batch(a, repair, only=None):
                     info = search_quality(src, a.encoder, a.preset, a.vmaf, a.min_saving, work, fixed_q, orig_size=size)
                     if info.get("q") is None:
                         say(L(f"   left as is: {info['why']}", f"   оставлен как есть: {info['why']}"))
-                        journal(dict(entry, status="kept", detail=info["why"], tries=info.get("tries")))
+                        journal(dict(entry, **verdict(a), status="kept", detail=info["why"], tries=info.get("tries")))
                         stats["kept"] += 1
                         if info.get("incompressible"):
                             problem(p, "incompressible", info["why"])
+                        place_unchanged(p, trimmed=rep if cut_time else None)
                         continue
                     say(L(f"   quality q={info['q']}: VMAF {info['vmaf']:.1f} on samples, predicted size {human(info['pred_size'])}", f"   качество q={info['q']}: VMAF {info['vmaf']:.1f} на пробах, прогноз {human(info['pred_size'])}"))
                     note = f"NFixer {VERSION}: {a.encoder} q={info['q']} vmaf={info['vmaf']} src=h264 {size} bytes"
@@ -1089,8 +1175,9 @@ def _batch(a, repair, only=None):
                 if not repair and not problems and out_size > size * (1 - a.min_saving):
                     os.remove(tmp)
                     say(L(f"   left as is: the result is {human(out_size)} - saving below {a.min_saving * 100:.0f}%", f"   оставлен как есть: результат {human(out_size)} - выигрыш меньше {a.min_saving * 100:.0f}%"))
-                    journal(dict(entry, status="kept", detail="not smaller", out_size=out_size, q=info["q"]))
+                    journal(dict(entry, **verdict(a), status="kept", detail="not smaller", out_size=out_size, q=info["q"]))
                     stats["kept"] += 1
+                    place_unchanged(p, trimmed=rep if cut_time else None)
                     continue
                 spot = spot_fail = None
                 if not repair and not problems:
@@ -1123,9 +1210,10 @@ def _batch(a, repair, only=None):
                     else:
                         why = L(f"fails the quality check even at the highest quality setting ({spot_fail})", f"не проходит проверку качества даже на самой качественной настройке ({spot_fail})")
                         say(L(f"   left as is: {why}", f"   оставлен как есть: {why}"))
-                        journal(dict(entry, status="kept", detail=why))
+                        journal(dict(entry, **verdict(a), status="kept", detail=why))
                         problem(p, "incompressible", why)
                         stats["kept"] += 1
+                        place_unchanged(p, trimmed=rep if cut_time else None)
                     continue
                 os.replace(tmp, dest)
                 set_file_times(dest, orig_st)
@@ -1152,6 +1240,12 @@ def _batch(a, repair, only=None):
                         os.remove(rep)
                 except OSError:
                     pass
+        pending = [p for p in copy_only if not os.path.exists(rel_dest(p, a.paths, a.out))]
+        if pending and not halted:
+            say(L(f"\nCopying files left unchanged in earlier runs: {len(pending)}", f"\nКопирую файлы, оставленные без изменений в прошлых запусках: {len(pending)}"))
+            for i, p in enumerate(pending, 1):
+                say(f"({i}/{len(pending)}) {p}")
+                place_unchanged(p)
     except KeyboardInterrupt:
         interrupted = True
         status("")
@@ -1171,6 +1265,8 @@ def _batch(a, repair, only=None):
     say(L(f"\nSummary: {stats['done']} processed, {stats['kept']} left as is, {stats['failed']} errors, time {hms(time.time() - t_start)}.", f"\nИтог: обработано {stats['done']}, оставлено как есть {stats['kept']}, ошибок {stats['failed']}, время {hms(time.time() - t_start)}."))
     if stats["done"]:
         say(L(f"Was {human(stats['in'])}, now {human(stats['out'])} - freed {human(stats['in'] - stats['out'])} ({100 - stats['out'] * 100 / stats['in']:.0f}%).", f"Было {human(stats['in'])}, стало {human(stats['out'])} - освобождено {human(stats['in'] - stats['out'])} ({100 - stats['out'] * 100 / stats['in']:.0f}%)."))
+    if stats["copied"]:
+        say(L(f"Copied to the output folder without compression: {stats['copied']} files, {human(stats['copied_bytes'])}.", f"Скопировано в папку результатов без сжатия: {stats['copied']} файлов, {human(stats['copied_bytes'])}."))
     say(L(f"Journal: {JOURNAL}", f"Журнал: {JOURNAL}"))
     code = 0 if not stats["failed"] else 2
     retry = [x for x in problems if x["kind"] == "retry"]
@@ -1238,6 +1334,8 @@ def main():
         p.add_argument("--limit", type=int, help=L("process at most N files", "обработать не больше N файлов"))
         p.add_argument("--max-hours", type=float, help=L("stop after N hours", "остановиться через N часов"))
         p.add_argument("--retry", action="store_true", help=L("retry files that were left as is before", "заново попробовать файлы, которые раньше были оставлены как есть"))
+        p.add_argument("--copy-kept", action="store_true", help=L("with --out: also copy files left unchanged into the output folder, so it holds the full set (a recording with a damaged head is copied with the head cut off)",
+                                                                  "вместе с --out: копировать в папку результатов и файлы, оставленные без изменений, чтобы там был полный набор (у записи с испорченным началом копируется обрезанная версия)"))
         p.add_argument("--better", action="store_true", help=L("files that failed the quality check last time are compressed one step higher quality", "файлы, не прошедшие проверку качества в прошлый раз, сжать на ступень качественнее"))
         p.add_argument("--only", help=L("text file (UTF-8): process only the files listed in it (the main list still defines the folder layout)", "текстовый файл (UTF-8): обработать только перечисленные в нём файлы (раскладку по папкам задаёт основной список)"))
         p.add_argument("--dry-run", action="store_true", help=L("only show what would be processed", "только показать, что будет обработано"))

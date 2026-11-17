@@ -128,6 +128,7 @@ class App(tk.Tk):
         self.out = tk.StringVar(value=cfg.get("out", ""))
         self.action = tk.StringVar(value=cfg.get("action", "check"))
         self.mode = tk.StringVar(value="out")  # режим замены оригиналов намеренно не запоминается
+        self.copy_kept = tk.BooleanVar(value=bool(cfg.get("copy_kept", False)))
         self.vmaf = cfg.get("vmaf", "95") if cfg.get("vmaf") in ("93", "95", "97") else "95"
         self.quality = tk.StringVar()
         self.lang_name = tk.StringVar()
@@ -213,10 +214,14 @@ class App(tk.Tk):
         self.e_out.grid(row=0, column=1, sticky="ew", padx=6)
         self.b_out = ttk.Button(f, text=T("Browse...", "Обзор..."), command=self._browse_out)
         self.b_out.grid(row=0, column=2, padx=(0, 8))
+        self.cb_copy = ttk.Checkbutton(f, variable=self.copy_kept,
+                                       text=T("Also copy files left unchanged there, so the folder holds the full set (takes extra disk space)",
+                                              "Копировать туда и файлы, оставленные без изменений, чтобы в папке был полный набор (займёт больше места)"))
+        self.cb_copy.grid(row=1, column=0, columnspan=3, sticky="w", padx=(int(28 * self.k), 8), pady=(0, 2))
         self.rb_rep = ttk.Radiobutton(f, value="replace", variable=self.mode,
                                       text=T("Replace the originals (each file only after it passes verification; cannot be undone)",
                                              "Заменить оригиналы (каждый файл - только после проверки; отменить нельзя)"))
-        self.rb_rep.grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=2)
+        self.rb_rep.grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=2)
 
         f = ttk.LabelFrame(body, text=T("Options", "Параметры"))
         f.grid(row=4, column=0, sticky="ew", **pad)
@@ -289,6 +294,7 @@ class App(tk.Tk):
         st = "normal" if writes and self.mode.get() == "out" and not busy else "disabled"
         self.e_out.configure(state=st)
         self.b_out.configure(state=st)
+        self.cb_copy.configure(state=st)
         self.cb_q.configure(state="readonly" if act in ("compress", "estimate") and not busy else "disabled")
         self.e_hours.configure(state="normal" if writes and not busy else "disabled")
         self.cb_lang.configure(state="disabled" if busy else "readonly")  # журнал идущей работы пишется на языке, выбранном при старте
@@ -414,7 +420,7 @@ class App(tk.Tk):
         try:
             os.makedirs(os.path.dirname(CFG), exist_ok=True)
             with open(CFG, "w", encoding="utf-8") as fh:
-                json.dump({"lang": nfixer.LANG, "items": self.items, "out": self.out.get(), "action": self.action.get(), "vmaf": self.vmaf,
+                json.dump({"lang": nfixer.LANG, "items": self.items, "out": self.out.get(), "action": self.action.get(), "vmaf": self.vmaf, "copy_kept": self.copy_kept.get(),
                            "days": self.days.get(), "hours": self.hours.get()}, fh, ensure_ascii=False, indent=1)
         except OSError:
             pass
@@ -456,6 +462,8 @@ class App(tk.Tk):
                         return None, T("The output folder must not be the folder of the source recordings or lie inside it.",
                                        "Папка для результатов не должна совпадать с папкой исходных записей или лежать внутри неё.")
                 cmd += ["--out", out]
+                if self.copy_kept.get():
+                    cmd.append("--copy-kept")
         return cmd, None
 
     def start(self):

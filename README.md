@@ -23,6 +23,11 @@ There are Start and Stop buttons, a progress bar and a log. Under the progress b
 time for the current file and for the whole job; the forecast is rough at first and is refined as files are
 processed. The language (English / Русский) is switched in the top right corner; English is the default.
 
+Only compressed files are written to the output folder; files left unchanged stay where they were. Tick "Also copy
+files left unchanged there" to get the full set in the output folder (a recording with a damaged head is copied
+with the head cut off). NFixer remembers which files it decided to leave unchanged and does not examine them again,
+unless the quality setting or the encoder changes.
+
 NFixer always goes through the whole list. A file that cannot be processed is skipped, and all such files are
 listed at the end of the log with the reason: not an `.mp4`, a broken file or not a video, a recording that
 cannot be compressed without visible loss even at the highest quality setting, a processing error. If a file was
@@ -44,7 +49,7 @@ nfixer repair   PATHS... --out FOLDER       cut the damaged head without re-enco
 
 `PATHS` is any number of folders and `.mp4` files; a long list can be passed as a file: `--list list.txt`.
 Useful options: `--days N` (recent files only), `--match TEXT` (filter by path), `--limit N`, `--max-hours N`,
-`--vmaf N`, `--dry-run`, `--better` (files that failed the quality check last time are compressed one step
+`--vmaf N`, `--dry-run`, `--copy-kept` (with `--out`: also copy files left unchanged), `--better` (files that failed the quality check last time are compressed one step
 higher quality; in an interactive console NFixer offers this itself at the end). A job can be interrupted with Ctrl+C and started again - it continues where it stopped.
 Messages are in English by default; `--lang ru` (before the command) or `NFIXER_LANG=ru` switches to Russian.
 
