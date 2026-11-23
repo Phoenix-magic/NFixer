@@ -9,6 +9,16 @@ Repairs and compresses game recordings made with NVIDIA Instant Replay (ShadowPl
 - finds clips whose head was destroyed by an Instant Replay buffer overflow and cuts the damaged part off;
 - compresses recordings from H.264 to HEVC without visible quality loss, verifying the result with the VMAF metric.
 
+## Why this exists
+
+This tool was born purely out of the rage I feel towards NVIDIA Instant Replay. That hellish app has been reliably
+breaking my footage for several months now, ignores my microphone and switches itself off at the most random
+moments. With around 3 TB of gameplay recordings piled up, simply moving to OBS was not enough. This tool mercilessly
+cuts off the broken parts of videos and shrinks most clips threefold, and in DaVinci Resolve I have not noticed any
+change in the quality of the footage. Use it if you need it. The tool was made in a couple of days and half of the
+code was written by Claude; I did review it, but AI-written code is AI-written code. So if you run into problems or
+bugs, [let me know](https://github.com/Phoenix-magic/NFixer/issues) and I will fix them.
+
 ## Installation
 
 Windows only.
