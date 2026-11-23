@@ -1,7 +1,7 @@
-# журнал обработанных файлов и настройки окна - в них пути к личным файлам
+# journal of processed files and window settings - they hold paths to personal files
 logs/
 __pycache__/
 *.pyc
-# локальная копия FFmpeg
+# local copy of FFmpeg
 ffmpeg/
 *.nfixer-tmp.mp4

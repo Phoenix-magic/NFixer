@@ -9,10 +9,19 @@ Repairs and compresses game recordings made with NVIDIA Instant Replay (ShadowPl
 - finds clips whose head was destroyed by an Instant Replay buffer overflow and cuts the damaged part off;
 - compresses recordings from H.264 to HEVC without visible quality loss, verifying the result with the VMAF metric.
 
-Windows only. Requires Python 3.9+ and [FFmpeg](https://ffmpeg.org/) built with libvmaf (`ffmpeg.exe` and
-`ffprobe.exe`). FFmpeg is looked up in an `ffmpeg` folder next to the program, then in `PATH`; another location
-can be given with `--ffmpeg FOLDER` or the `NFIXER_FFMPEG` environment variable. Compression uses an NVIDIA GPU
-with an HEVC encoder by default; without one, use `--encoder x265`.
+## Installation
+
+Windows only.
+
+1. Install [Python](https://www.python.org/downloads/) 3.9 or newer; in the installer tick "Add python.exe to PATH".
+2. Download NFixer (**Code → Download ZIP** on this page) and unpack it into any folder.
+3. Download FFmpeg built with libvmaf, for example the *essentials* build from
+   [gyan.dev](https://www.gyan.dev/ffmpeg/builds/), and unpack it into an `ffmpeg` folder next to `NFixer.pyw`, so
+   that `ffmpeg\bin\ffmpeg.exe` exists. An FFmpeg already in `PATH` works too; another location can be given with
+   `--ffmpeg FOLDER` or the `NFIXER_FFMPEG` environment variable.
+
+Compression uses an NVIDIA GPU with an HEVC encoder by default; without one, use `--encoder x265`.
+Checking recordings for damage needs neither FFmpeg nor a GPU.
 
 ## The window
 
@@ -39,6 +48,8 @@ where it left off. Do not run two copies on the same folders at the same time.
 
 ## Command line
 
+Run from the NFixer folder: `nfixer` here is `nfixer.bat`; `python nfixer.py` works the same way.
+
 ```
 nfixer check    PATHS... [--days N]         find damaged recordings (read-only)
 nfixer estimate PATHS... [--files 12]       predict the saving on a random sample (read-only)
@@ -49,9 +60,12 @@ nfixer repair   PATHS... --out FOLDER       cut the damaged head without re-enco
 
 `PATHS` is any number of folders and `.mp4` files; a long list can be passed as a file: `--list list.txt`.
 Useful options: `--days N` (recent files only), `--match TEXT` (filter by path), `--limit N`, `--max-hours N`,
-`--vmaf N`, `--dry-run`, `--copy-kept` (with `--out`: also copy files left unchanged), `--better` (files that failed the quality check last time are compressed one step
-higher quality; in an interactive console NFixer offers this itself at the end). A job can be interrupted with Ctrl+C and started again - it continues where it stopped.
-Messages are in English by default; `--lang ru` (before the command) or `NFIXER_LANG=ru` switches to Russian.
+`--vmaf N`, `--dry-run`, `--copy-kept` (with `--out`: also copy files left unchanged), `--better` (files that
+failed the quality check last time are compressed one step higher quality; in an interactive console NFixer offers
+this itself at the end). `python nfixer.py COMMAND --help` lists every option. The output folder must not be a
+source folder or lie inside one. A job can be interrupted with Ctrl+C and started again - it continues where it
+stopped. Messages are in English by default; `--lang ru` (before the command) or `NFIXER_LANG=ru` switches to
+Russian.
 
 Example: check the recordings of the last day.
 
@@ -119,4 +133,6 @@ frame and by a full decode.
 
 - The journal of processed files and the window settings live in the `logs` folder next to the program.
 - The icon is drawn by `tools/make_icon.py` (requires Pillow).
+- Tests: `python -m unittest` in the NFixer folder. The ones that need FFmpeg (with libx264 and libx265) are skipped
+  without it.
 - NFixer is not affiliated with NVIDIA. NVIDIA, ShadowPlay and Instant Replay are trademarks of their owner.

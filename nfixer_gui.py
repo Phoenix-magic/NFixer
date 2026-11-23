@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """NFixer window for nfixer.py: a list of files and folders, an action, progress and a log. The work itself is done by nfixer.py."""
+
 import ctypes
 import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,16 +23,43 @@ CFG = os.path.join(HERE, "logs", "gui.json")
 ICON = os.path.join(HERE, "nfixer.ico")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 LANGS = [("en", "English"), ("ru", "Русский")]
-T = nfixer.L  # T(english, russian) -> текст на текущем языке (язык хранится в nfixer.LANG)
+# log lines shown in red; both languages, since the log may predate a language change
+BAD_MARKS = ("ERROR", "ОШИБКА", "DAMAGED", "ПОВРЕЖДЁН", "Traceback", "FAILED", "НЕ ПРОЙДЕНА", "PROBLEM FILES",
+             "ПРОБЛЕМНЫЕ ФАЙЛЫ")
+T = nfixer.L  # T(english, russian) -> text in the current language (stored in nfixer.LANG)
 
 
 def actions():
     return [
-        ("check", T("Check", "Проверить"), T("Find recordings with a damaged head. Changes nothing.", "Найти записи с испорченным началом. Ничего не изменяет.")),
-        ("estimate", T("Estimate saving", "Оценить экономию"),
-         T("Forecast for the list (12 random files if there are more). Changes nothing.", "Прогноз по списку (если файлов больше 12 - по 12 случайным). Ничего не изменяет.")),
-        ("compress", T("Compress", "Сжать"), T("Re-encode to HEVC with quality control; audio is left untouched.", "Перекодировать в HEVC с контролем качества, звук без изменений.")),
-        ("repair", T("Cut damaged head", "Обрезать испорченное начало"), T("No re-encoding; damaged recordings only.", "Без перекодирования, только у повреждённых записей.")),
+        (
+            "check",
+            T("Check", "Проверить"),
+            T(
+                "Find recordings with a damaged head. Changes nothing.",
+                "Найти записи с испорченным началом. Ничего не изменяет.",
+            ),
+        ),
+        (
+            "estimate",
+            T("Estimate saving", "Оценить экономию"),
+            T(
+                "Forecast for the list (12 random files if there are more). Changes nothing.",
+                "Прогноз по списку (если файлов больше 12 - по 12 случайным). Ничего не изменяет.",
+            ),
+        ),
+        (
+            "compress",
+            T("Compress", "Сжать"),
+            T(
+                "Re-encode to HEVC with quality control; audio is left untouched.",
+                "Перекодировать в HEVC с контролем качества, звук без изменений.",
+            ),
+        ),
+        (
+            "repair",
+            T("Cut damaged head", "Обрезать испорченное начало"),
+            T("No re-encoding; damaged recordings only.", "Без перекодирования, только у повреждённых записей."),
+        ),
     ]
 
 
@@ -43,11 +72,11 @@ def qualities():
 
 
 def enable_hidpi():
-    """Сообщить Windows, что окно само масштабируется под плотность экрана - иначе на 4K его растягивают, и текст выглядит размытым."""
+    """Tell Windows the window scales itself to the screen density - otherwise it is stretched on 4K and the text looks blurry."""
     if os.name != "nt":
         return
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP + ".App")  # своя иконка на панели задач
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP + ".App")  # own icon on the taskbar
     except Exception:
         pass
     try:
@@ -60,16 +89,18 @@ def enable_hidpi():
 
 
 class DropTarget:
-    """Приём файлов, перетащенных из Проводника (Windows, без сторонних библиотек).
+    """Accepts files dragged from Explorer (Windows, no third-party libraries).
 
-    Подменяет оконную процедуру окна и ловит WM_DROPFILES. Пути складываются в очередь;
-    из обработчика сообщений Tk не вызывается.
+    Replaces the window procedure and catches WM_DROPFILES. The paths are put into a queue;
+    Tk is not called from the message handler.
     """
+
     WM_DROPFILES = 0x0233
     GWLP_WNDPROC = -4
 
     def __init__(self, hwnd, out_queue):
         from ctypes import wintypes
+
         self.q = out_queue
         self.hwnd = hwnd
         u, s = ctypes.windll.user32, ctypes.windll.shell32
@@ -84,7 +115,7 @@ class DropTarget:
         s.DragFinish.argtypes = [ctypes.c_void_p]
         s.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
         self._u, self._s = u, s
-        self._new = self._proto(self._wndproc)  # ссылку нужно хранить, иначе обратный вызов соберёт сборщик мусора
+        self._new = self._proto(self._wndproc)  # keep the reference, or the garbage collector frees the callback
         s.DragAcceptFiles(hwnd, True)
         self._old = u.SetWindowLongPtrW(hwnd, self.GWLP_WNDPROC, ctypes.cast(self._new, ctypes.c_void_p))
 
@@ -110,7 +141,7 @@ class App(tk.Tk):
     def __init__(self, initial=()):
         enable_hidpi()
         super().__init__()
-        self.k = self.winfo_fpixels("1i") / 96.0  # масштаб экрана (1.0 = 100%, 1.5 = 150% ...)
+        self.k = self.winfo_fpixels("1i") / 96.0  # screen scale (1.0 = 100%, 1.5 = 150% ...)
         self.minsize(int(780 * self.k), int(700 * self.k))
         if os.path.isfile(ICON):
             try:
@@ -127,7 +158,7 @@ class App(tk.Tk):
         self.items = []
         self.out = tk.StringVar(value=cfg.get("out", ""))
         self.action = tk.StringVar(value=cfg.get("action", "check"))
-        self.mode = tk.StringVar(value="out")  # режим замены оригиналов намеренно не запоминается
+        self.mode = tk.StringVar(value="out")  # replacing the originals is deliberately not remembered
         self.copy_kept = tk.BooleanVar(value=bool(cfg.get("copy_kept", False)))
         self.vmaf = cfg.get("vmaf", "95") if cfg.get("vmaf") in ("93", "95", "97") else "95"
         self.quality = tk.StringVar()
@@ -136,11 +167,12 @@ class App(tk.Tk):
         self.hours = tk.StringVar(value=cfg.get("hours", ""))
         self.state_text = tk.StringVar()
         self.eta_text = tk.StringVar()
-        self.eta = None  # прогноз времени от nfixer.py: (когда получен, секунд на файл, секунд на весь остаток)
-        self.retry_paths = []  # файлы, не прошедшие проверку качества в последнем запуске
+        self.eta = None  # time forecast from nfixer.py: (when received, seconds for the file, seconds for the rest)
+        self.retry_paths = []  # files that failed the quality check in the last run
         self.problem_count = 0
         self.last_cmd = None
         self.onlyfile = None
+        self.workdir = None  # scratch folder of the running job, removed when it ends (also after Stop)
         self.body = None
         self.items = self._clean(list(initial) or cfg.get("items", []))[0]
         self._build()
@@ -153,12 +185,12 @@ class App(tk.Tk):
                 self.update_idletasks()
                 self.drop = DropTarget(self.winfo_id(), self.dropq)
             except Exception:
-                self.drop = None  # перетаскивание - удобство; без него остаются кнопки добавления
+                self.drop = None  # drag and drop is a convenience; the add buttons still work without it
         self.after(200, self._poll_drop)
 
-    # ---------------------------------------------------------------- интерфейс
+    # ---------------------------------------------------------------- interface
     def _build(self):
-        """Построить (или перестроить после смены языка) всё содержимое окна."""
+        """Build (or rebuild after a language change) the whole window content."""
         old_log = self.log.get("1.0", "end-1c") if self.body else ""
         old_bar = self.bar["value"] if self.body else 0
         if self.body:
@@ -174,14 +206,21 @@ class App(tk.Tk):
 
         f = ttk.Frame(body)
         f.grid(row=0, column=0, sticky="ew", padx=p, pady=(int(6 * self.k), 0))
-        self.cb_lang = ttk.Combobox(f, textvariable=self.lang_name, values=[n for _, n in LANGS], state="readonly", width=10)
+        self.cb_lang = ttk.Combobox(
+            f, textvariable=self.lang_name, values=[n for _, n in LANGS], state="readonly", width=10
+        )
         self.cb_lang.pack(side="right")
         ttk.Label(f, text="Language / Язык:").pack(side="right", padx=6)
         self.lang_name.set(dict(LANGS)[nfixer.LANG])
         self.cb_lang.bind("<<ComboboxSelected>>", self._on_lang)
 
-        f = ttk.LabelFrame(body, text=T("What to process (.mp4 videos and folders can be dragged here from Explorer)",
-                                        "Что обработать (видео .mp4 и папки можно перетащить сюда из Проводника)"))
+        f = ttk.LabelFrame(
+            body,
+            text=T(
+                "What to process (.mp4 videos and folders can be dragged here from Explorer)",
+                "Что обработать (видео .mp4 и папки можно перетащить сюда из Проводника)",
+            ),
+        )
         f.grid(row=1, column=0, sticky="ew", **pad)
         f.columnconfigure(0, weight=1)
         self.lb = tk.Listbox(f, height=5, selectmode="extended", activestyle="none")
@@ -192,8 +231,14 @@ class App(tk.Tk):
         for it in self.items:
             self.lb.insert("end", it)
         self.src_buttons = []
-        for i, (text, cmd) in enumerate(((T("Add files...", "Добавить файлы..."), self._add_files), (T("Add folder...", "Добавить папку..."), self._add_folder),
-                                         (T("Remove selected", "Убрать выбранное"), self._remove_selected), (T("Clear list", "Очистить список"), self._clear_items))):
+        for i, (text, cmd) in enumerate(
+            (
+                (T("Add files...", "Добавить файлы..."), self._add_files),
+                (T("Add folder...", "Добавить папку..."), self._add_folder),
+                (T("Remove selected", "Убрать выбранное"), self._remove_selected),
+                (T("Clear list", "Очистить список"), self._clear_items),
+            )
+        ):
             b = ttk.Button(f, text=text, command=cmd)
             b.grid(row=i, column=2, sticky="ew", padx=8, pady=1)
             self.src_buttons.append(b)
@@ -202,25 +247,40 @@ class App(tk.Tk):
         f.grid(row=2, column=0, sticky="ew", **pad)
         f.columnconfigure(1, weight=1)
         for i, (key, title, hint) in enumerate(actions()):
-            ttk.Radiobutton(f, text=title, value=key, variable=self.action).grid(row=i, column=0, sticky="w", padx=8, pady=2)
+            ttk.Radiobutton(f, text=title, value=key, variable=self.action).grid(
+                row=i, column=0, sticky="w", padx=8, pady=2
+            )
             ttk.Label(f, text=hint, foreground="#555").grid(row=i, column=1, sticky="w", padx=8)
 
         f = ttk.LabelFrame(body, text=T("Where to save the result", "Куда сохранять результат"))
         f.grid(row=3, column=0, sticky="ew", **pad)
         f.columnconfigure(1, weight=1)
-        self.rb_out = ttk.Radiobutton(f, text=T("To a separate folder:", "В отдельную папку:"), value="out", variable=self.mode)
+        self.rb_out = ttk.Radiobutton(
+            f, text=T("To a separate folder:", "В отдельную папку:"), value="out", variable=self.mode
+        )
         self.rb_out.grid(row=0, column=0, sticky="w", padx=8, pady=2)
         self.e_out = ttk.Entry(f, textvariable=self.out)
         self.e_out.grid(row=0, column=1, sticky="ew", padx=6)
         self.b_out = ttk.Button(f, text=T("Browse...", "Обзор..."), command=self._browse_out)
         self.b_out.grid(row=0, column=2, padx=(0, 8))
-        self.cb_copy = ttk.Checkbutton(f, variable=self.copy_kept,
-                                       text=T("Also copy files left unchanged there, so the folder holds the full set (takes extra disk space)",
-                                              "Копировать туда и файлы, оставленные без изменений, чтобы в папке был полный набор (займёт больше места)"))
+        self.cb_copy = ttk.Checkbutton(
+            f,
+            variable=self.copy_kept,
+            text=T(
+                "Also copy files left unchanged there, so the folder holds the full set (takes extra disk space)",
+                "Копировать туда и файлы, оставленные без изменений, чтобы в папке был полный набор (займёт больше места)",
+            ),
+        )
         self.cb_copy.grid(row=1, column=0, columnspan=3, sticky="w", padx=(int(28 * self.k), 8), pady=(0, 2))
-        self.rb_rep = ttk.Radiobutton(f, value="replace", variable=self.mode,
-                                      text=T("Replace the originals (each file only after it passes verification; cannot be undone)",
-                                             "Заменить оригиналы (каждый файл - только после проверки; отменить нельзя)"))
+        self.rb_rep = ttk.Radiobutton(
+            f,
+            value="replace",
+            variable=self.mode,
+            text=T(
+                "Replace the originals (each file only after it passes verification; cannot be undone)",
+                "Заменить оригиналы (каждый файл - только после проверки; отменить нельзя)",
+            ),
+        )
         self.rb_rep.grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=2)
 
         f = ttk.LabelFrame(body, text=T("Options", "Параметры"))
@@ -231,8 +291,13 @@ class App(tk.Tk):
         self.cb_q = ttk.Combobox(f, textvariable=self.quality, values=[name for _, name in q], state="readonly")
         self.cb_q.grid(row=0, column=1, sticky="ew", padx=(0, 8))
         self.quality.set(dict(q)[self.vmaf])
-        self.cb_q.bind("<<ComboboxSelected>>", lambda e: setattr(self, "vmaf", {name: v for v, name in qualities()}.get(self.quality.get(), "95")))
-        ttk.Label(f, text=T("Only files from the last", "Только файлы за последние")).grid(row=1, column=0, sticky="w", padx=8, pady=2)
+        self.cb_q.bind(
+            "<<ComboboxSelected>>",
+            lambda e: setattr(self, "vmaf", {name: v for v, name in qualities()}.get(self.quality.get(), "95")),
+        )
+        ttk.Label(f, text=T("Only files from the last", "Только файлы за последние")).grid(
+            row=1, column=0, sticky="w", padx=8, pady=2
+        )
         g = ttk.Frame(f)
         g.grid(row=1, column=1, sticky="w")
         ttk.Entry(g, textvariable=self.days, width=6).pack(side="left")
@@ -248,7 +313,9 @@ class App(tk.Tk):
         self.b_start.pack(side="left")
         self.b_stop = ttk.Button(f, text=T("Stop", "Стоп"), command=self.stop, state="disabled")
         self.b_stop.pack(side="left", padx=6)
-        ttk.Button(f, text=T("Open output folder", "Открыть папку результатов"), command=self._open_out).pack(side="right")
+        ttk.Button(f, text=T("Open output folder", "Открыть папку результатов"), command=self._open_out).pack(
+            side="right"
+        )
         ttk.Button(f, text=T("Clear log", "Очистить журнал"), command=self._clear_log).pack(side="right", padx=6)
 
         f = ttk.Frame(body)
@@ -257,7 +324,9 @@ class App(tk.Tk):
         self.bar = ttk.Progressbar(f, maximum=100, value=old_bar)
         self.bar.grid(row=0, column=0, sticky="ew")
         ttk.Label(f, textvariable=self.state_text, anchor="w").grid(row=1, column=0, sticky="ew", pady=(3, 0))
-        ttk.Label(f, textvariable=self.eta_text, anchor="w", foreground="#1a4fa0").grid(row=2, column=0, sticky="ew", pady=(2, 0))
+        ttk.Label(f, textvariable=self.eta_text, anchor="w", foreground="#1a4fa0").grid(
+            row=2, column=0, sticky="ew", pady=(2, 0)
+        )
         self.state_text.set(T("Ready", "Готов к работе"))
 
         f = ttk.Frame(body)
@@ -285,7 +354,7 @@ class App(tk.Tk):
             self._build()
 
     def _sync(self):
-        """Включить только те поля, которые относятся к выбранному действию."""
+        """Enable only the fields that apply to the chosen action."""
         act = self.action.get()
         writes = act in ("compress", "repair")
         busy = self.proc is not None
@@ -297,13 +366,15 @@ class App(tk.Tk):
         self.cb_copy.configure(state=st)
         self.cb_q.configure(state="readonly" if act in ("compress", "estimate") and not busy else "disabled")
         self.e_hours.configure(state="normal" if writes and not busy else "disabled")
-        self.cb_lang.configure(state="disabled" if busy else "readonly")  # журнал идущей работы пишется на языке, выбранном при старте
+        self.cb_lang.configure(
+            state="disabled" if busy else "readonly"
+        )  # a running job logs in the language chosen at its start
         for b in self.src_buttons:
             b.configure(state="disabled" if busy else "normal")
 
-    # ---------------------------------------------------------------- список файлов и папок
+    # ---------------------------------------------------------------- list of files and folders
     def _clean(self, paths, have=()):
-        """Оставить папки и файлы .mp4, убрать повторы. Возвращает (годные пути, отвергнутые пути)."""
+        """Keep folders and .mp4 files, drop duplicates. Returns (accepted paths, rejected paths)."""
         seen = {os.path.normcase(x) for x in have}
         good, skipped = [], []
         for raw in paths:
@@ -319,7 +390,7 @@ class App(tk.Tk):
         return good, skipped
 
     def add_paths(self, paths, quiet=False):
-        """Добавить в список папки и файлы .mp4; остальное не брать и объяснить почему. Возвращает (добавлено, пропущено)."""
+        """Add folders and .mp4 files to the list; refuse the rest and explain why. Returns (added, skipped)."""
         good, skipped = self._clean(paths, self.items)
         for p in good:
             self.items.append(p)
@@ -329,11 +400,20 @@ class App(tk.Tk):
             msg += T(f", not accepted: {len(skipped)}", f", не принято: {len(skipped)}")
         self.state_text.set(msg + T(f". In the list: {len(self.items)}", f". Всего в списке: {len(self.items)}"))
         if skipped and not quiet:
-            rows = [("- " + os.path.basename(p) + ("" if os.path.exists(p) else T("  (not found)", "  (не найден)"))) for p in skipped[:8]]
+            rows = [
+                ("- " + os.path.basename(p) + ("" if os.path.exists(p) else T("  (not found)", "  (не найден)")))
+                for p in skipped[:8]
+            ]
             if len(skipped) > 8:
                 rows.append(T(f"... and {len(skipped) - 8} more", f"... и ещё {len(skipped) - 8}"))
-            messagebox.showwarning(APP, T("These files were not added: NFixer works only with .mp4 recordings.\n\n",
-                                          "Эти файлы не добавлены: NFixer работает только с записями .mp4.\n\n") + "\n".join(rows))
+            messagebox.showwarning(
+                APP,
+                T(
+                    "These files were not added: NFixer works only with .mp4 recordings.\n\n",
+                    "Эти файлы не добавлены: NFixer работает только с записями .mp4.\n\n",
+                )
+                + "\n".join(rows),
+            )
         return len(good), len(skipped)
 
     def _poll_drop(self):
@@ -343,14 +423,21 @@ class App(tk.Tk):
                 if self.proc is None:
                     self.add_paths(paths)
                 else:
-                    self.state_text.set(T("Busy - files can be added once the current job ends", "Идёт работа - добавить файлы можно после её окончания"))
+                    self.state_text.set(
+                        T(
+                            "Busy - files can be added once the current job ends",
+                            "Идёт работа - добавить файлы можно после её окончания",
+                        )
+                    )
         except queue.Empty:
             pass
         self.after(200, self._poll_drop)
 
     def _add_files(self):
-        r = filedialog.askopenfilenames(title=T("Choose videos", "Выберите видео"),
-                                        filetypes=[(T("MP4 video", "Видео MP4"), "*.mp4"), (T("All files", "Все файлы"), "*.*")])
+        r = filedialog.askopenfilenames(
+            title=T("Choose videos", "Выберите видео"),
+            filetypes=[(T("MP4 video", "Видео MP4"), "*.mp4"), (T("All files", "Все файлы"), "*.*")],
+        )
         if r:
             self.add_paths(r)
 
@@ -383,13 +470,19 @@ class App(tk.Tk):
         if d and os.path.isdir(d):
             os.startfile(d)
         else:
-            messagebox.showinfo(APP, T("That folder does not exist yet.", "Такой папки пока нет.") if d else T("No output folder chosen.", "Папка результатов не выбрана."))
+            messagebox.showinfo(
+                APP,
+                (
+                    T("That folder does not exist yet.", "Такой папки пока нет.")
+                    if d
+                    else T("No output folder chosen.", "Папка результатов не выбрана.")
+                ),
+            )
 
     @staticmethod
     def _tag(line):
-        """Цвет строки журнала. Признаки ищутся на обоих языках: журнал мог быть написан до смены языка."""
-        if any(w in line for w in ("ERROR", "ОШИБКА", "DAMAGED", "ПОВРЕЖДЁН", "Traceback", "FAILED", "НЕ ПРОЙДЕНА", "PROBLEM FILES", "ПРОБЛЕМНЫЕ ФАЙЛЫ")) \
-                or line.lstrip().startswith("! "):
+        """Colour of a log line. Markers are matched in both languages: the log may predate a language change."""
+        if any(w in line for w in BAD_MARKS) or line.lstrip().startswith("! "):
             return "bad"
         if any(w in line for w in ("done:", "готово:")) or line.startswith(("Was ", "Было ")):
             return "good"
@@ -408,7 +501,7 @@ class App(tk.Tk):
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
 
-    # ---------------------------------------------------------------- настройки
+    # ---------------------------------------------------------------- settings
     def _load_cfg(self):
         try:
             with open(CFG, encoding="utf-8") as fh:
@@ -420,23 +513,41 @@ class App(tk.Tk):
         try:
             os.makedirs(os.path.dirname(CFG), exist_ok=True)
             with open(CFG, "w", encoding="utf-8") as fh:
-                json.dump({"lang": nfixer.LANG, "items": self.items, "out": self.out.get(), "action": self.action.get(), "vmaf": self.vmaf, "copy_kept": self.copy_kept.get(),
-                           "days": self.days.get(), "hours": self.hours.get()}, fh, ensure_ascii=False, indent=1)
+                json.dump(
+                    {
+                        "lang": nfixer.LANG,
+                        "items": self.items,
+                        "out": self.out.get(),
+                        "action": self.action.get(),
+                        "vmaf": self.vmaf,
+                        "copy_kept": self.copy_kept.get(),
+                        "days": self.days.get(),
+                        "hours": self.hours.get(),
+                    },
+                    fh,
+                    ensure_ascii=False,
+                    indent=1,
+                )
         except OSError:
             pass
 
-    # ---------------------------------------------------------------- запуск
+    # ---------------------------------------------------------------- running a job
     def build_command(self):
-        """Собрать аргументы nfixer.py по состоянию окна (без списка путей). Возвращает (аргументы, None) или (None, текст ошибки)."""
+        """Build the nfixer.py arguments from the window state (without the paths). Returns (args, None) or (None, error)."""
         act = self.action.get()
         if not self.items:
-            return None, T("The list is empty. Add a video or a folder with the buttons on the right or by dragging it in.",
-                           "Список пуст. Добавьте видео или папку: кнопками справа или перетаскиванием.")
+            return None, T(
+                "The list is empty. Add a video or a folder with the buttons on the right or by dragging it in.",
+                "Список пуст. Добавьте видео или папку: кнопками справа или перетаскиванием.",
+            )
         missing = [p for p in self.items if not os.path.exists(p)]
         if missing:
             return None, T("Not found:\n", "Не найдено:\n") + "\n".join(missing[:5])
         cmd = [act]
-        for var, opt, name in ((self.days, "--days", T("days", "дней")), (self.hours, "--max-hours", T("hours", "часов"))):
+        for var, opt, name in (
+            (self.days, "--days", T("days", "дней")),
+            (self.hours, "--max-hours", T("hours", "часов")),
+        ):
             val = var.get().strip().replace(",", ".")
             if not val or (opt == "--max-hours" and act not in ("compress", "repair")):
                 continue
@@ -455,12 +566,9 @@ class App(tk.Tk):
                 out = self.out.get().strip().strip('"')
                 if not out:
                     return None, T("Choose an output folder.", "Укажите папку для результатов.")
-                a = os.path.normcase(os.path.abspath(out))
-                for p in self.items:
-                    b = os.path.normcase(os.path.abspath(p if os.path.isdir(p) else os.path.dirname(p)))
-                    if a == b or (os.path.isdir(p) and a.startswith(b + os.sep)):
-                        return None, T("The output folder must not be the folder of the source recordings or lie inside it.",
-                                       "Папка для результатов не должна совпадать с папкой исходных записей или лежать внутри неё.")
+                err = nfixer.out_folder_error(out, self.items)
+                if err:
+                    return None, err
                 cmd += ["--out", out]
                 if self.copy_kept.get():
                     cmd.append("--copy-kept")
@@ -474,17 +582,23 @@ class App(tk.Tk):
             messagebox.showerror(APP, err)
             return
         if "--replace" in cmd and not messagebox.askyesno(
-                APP, T("The originals will be REPLACED with the result.\n\nEach file is replaced only after it passes verification, "
-                       "but the original cannot be brought back afterwards.\n\nContinue?",
-                       "Оригиналы будут ЗАМЕНЕНЫ результатом.\n\nКаждый файл заменяется только после успешной проверки, "
-                       "но вернуть исходный файл после этого будет нельзя.\n\nПродолжить?"), icon="warning", default="no"):
+            APP,
+            T(
+                "The originals will be REPLACED with the result.\n\nEach file is replaced only after it passes verification, "
+                "but the original cannot be brought back afterwards.\n\nContinue?",
+                "Оригиналы будут ЗАМЕНЕНЫ результатом.\n\nКаждый файл заменяется только после успешной проверки, "
+                "но вернуть исходный файл после этого будет нельзя.\n\nПродолжить?",
+            ),
+            icon="warning",
+            default="no",
+        ):
             return
         self._save_cfg()
         self._launch(cmd)
 
     def _launch(self, cmd, only=None):
-        """Запустить nfixer.py. only - список файлов для повтора на ступень качественнее (остальное из списка не трогается)."""
-        # пути передаются списком в файле: при перетаскивании сотен видео командная строка была бы слишком длинной
+        """Run nfixer.py. only - files to retry one step higher quality (the rest of the list is left alone)."""
+        # the paths are passed in a list file: with hundreds of dropped videos the command line would be too long
         fd, self.listfile = tempfile.mkstemp(prefix="nfixer-list-", suffix=".txt")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write("\n".join(self.items))
@@ -497,13 +611,16 @@ class App(tk.Tk):
         py = os.path.join(os.path.dirname(sys.executable), "python.exe")
         if not os.path.isfile(py):
             py = sys.executable
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", NFIXER_GUI="1")
+        self.workdir = tempfile.mkdtemp(prefix="nfixer-gui-")
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", NFIXER_GUI="1", NFIXER_WORKDIR=self.workdir)
         self.stopped = False
         self.last_cmd = cmd
         self.retry_paths, self.problem_count, self.eta = [], 0, None
         self.eta_text.set("")
-        self.proc = subprocess.Popen([py, "-u", "-X", "utf8", os.path.join(HERE, "nfixer.py"), "--lang", nfixer.LANG, cmd[0], "--list", self.listfile] + cmd[1:] + extra,
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env, cwd=HERE, creationflags=NO_WINDOW)
+        args = [py, "-u", "-X", "utf8", os.path.join(HERE, "nfixer.py"), "--lang", nfixer.LANG, cmd[0],
+                "--list", self.listfile] + cmd[1:] + extra
+        self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                     env=env, cwd=HERE, creationflags=NO_WINDOW)
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
         self.b_start.configure(state="disabled")
         self.b_stop.configure(state="normal")
@@ -511,23 +628,39 @@ class App(tk.Tk):
         self.state_text.set(T("Working...", "Работаю..."))
         title = dict((a[0], a[1]) for a in actions())[cmd[0]]
         if only:
-            self._write(T(f"=== {title}, one step higher quality: {len(only)} file(s) ===", f"=== {title}, на ступень качественнее: файлов - {len(only)} ==="), "head")
+            self._write(
+                T(
+                    f"=== {title}, one step higher quality: {len(only)} file(s) ===",
+                    f"=== {title}, на ступень качественнее: файлов - {len(only)} ===",
+                ),
+                "head",
+            )
         else:
-            self._write(T(f"=== {title}: {len(self.items)} item(s) in the list ===", f"=== {title}: объектов в списке - {len(self.items)} ==="), "head")
+            self._write(
+                T(
+                    f"=== {title}: {len(self.items)} item(s) in the list ===",
+                    f"=== {title}: объектов в списке - {len(self.items)} ===",
+                ),
+                "head",
+            )
         self._sync()
         self.after(100, self._poll)
         self.after(500, self._tick)
 
     def _tick(self):
-        """Раз в полсекунды обновлять обратный отсчёт: сколько осталось на текущий файл и на всю работу."""
+        """Every half second refresh the countdown: time left for the current file and for the whole job."""
         if not self.proc:
             return
         if self.eta:
             got, one, rest = self.eta
             el = time.time() - got
             left = lambda s: nfixer.hms(s - el) if s - el >= 1 else T("almost done", "вот-вот")
-            self.eta_text.set(T(f"This file: about {nfixer.hms(one)}, left {left(one)}      Whole job: left about {left(rest)}",
-                                f"Этот файл: около {nfixer.hms(one)}, осталось {left(one)}      Вся работа: осталось около {left(rest)}"))
+            self.eta_text.set(
+                T(
+                    f"This file: about {nfixer.hms(one)}, left {left(one)}      Whole job: left about {left(rest)}",
+                    f"Этот файл: около {nfixer.hms(one)}, осталось {left(one)}      Вся работа: осталось около {left(rest)}",
+                )
+            )
         self.after(500, self._tick)
 
     def _reader(self, proc):
@@ -550,7 +683,7 @@ class App(tk.Tk):
             self.after(100, self._poll)
 
     def _handle(self, line):
-        if line.startswith(("@@#", "@@!")):  # служебные строки: прогноз времени и итоговый список проблемных файлов
+        if line.startswith(("@@#", "@@!")):  # service lines: time forecast and the final list of problem files
             try:
                 d = json.loads(line[3:])
             except ValueError:
@@ -589,6 +722,9 @@ class App(tk.Tk):
             except OSError:
                 pass
             self.onlyfile = None
+        if self.workdir:
+            shutil.rmtree(self.workdir, ignore_errors=True)  # after Stop nfixer.py has no chance to clean up
+            self.workdir = None
         self.eta = None
         self.eta_text.set("")
         self.b_start.configure(state="normal")
@@ -596,31 +732,56 @@ class App(tk.Tk):
         if self.stopped:
             removed = self._cleanup()
             self.state_text.set(T("Stopped", "Остановлено"))
-            self._write(T("Stopped. The originals are intact" + (", the unfinished file was removed." if removed else ".") + " Starting again continues where it left off.",
-                          "Остановлено. Оригиналы целы" + (", недописанный файл удалён." if removed else ".") + " Повторный запуск продолжит с места остановки."), "head")
+            self._write(
+                T(
+                    "Stopped. The originals are intact"
+                    + (", the unfinished file was removed." if removed else ".")
+                    + " Starting again continues where it left off.",
+                    "Остановлено. Оригиналы целы"
+                    + (", недописанный файл удалён." if removed else ".")
+                    + " Повторный запуск продолжит с места остановки.",
+                ),
+                "head",
+            )
         else:
             self.bar.configure(value=100)
-            self.state_text.set(T("Finished", "Готово") + (T(f" - problem files: {self.problem_count} (listed at the end of the log)",
-                                                              f" - проблемных файлов: {self.problem_count} (перечислены в конце журнала)") if self.problem_count else ""))
+            self.state_text.set(
+                T("Finished", "Готово")
+                + (
+                    T(
+                        f" - problem files: {self.problem_count} (listed at the end of the log)",
+                        f" - проблемных файлов: {self.problem_count} (перечислены в конце журнала)",
+                    )
+                    if self.problem_count
+                    else ""
+                )
+            )
         self._sync()
         if not self.stopped and self.retry_paths and self.last_cmd:
             self.after(50, self._offer_retry)
 
     def _offer_retry(self):
-        """Файлы, не прошедшие проверку качества, были пропущены. Решение о повторе - за пользователем."""
+        """Files that failed the quality check were skipped. Whether to retry is the user's call."""
         paths = self.retry_paths
         rows = ["- " + os.path.basename(p) for p in paths[:10]]
         if len(paths) > 10:
             rows.append(T(f"... and {len(paths) - 10} more", f"... и ещё {len(paths) - 10}"))
-        if messagebox.askyesno(APP, T(f"{len(paths)} file(s) did not pass the quality check after compression and were skipped (the originals are untouched):\n\n",
-                                      f"Файлов, не прошедших проверку качества после сжатия: {len(paths)}. Они пропущены, оригиналы не тронуты:\n\n")
-                               + "\n".join(rows)
-                               + T("\n\nCompress them again one step higher quality?\nThe files will come out somewhat larger; the other settings stay the same.",
-                                   "\n\nСжать их ещё раз на ступень качественнее?\nФайлы выйдут немного крупнее; остальные настройки те же.")):
+        if messagebox.askyesno(
+            APP,
+            T(
+                f"{len(paths)} file(s) did not pass the quality check after compression and were skipped (the originals are untouched):\n\n",
+                f"Файлов, не прошедших проверку качества после сжатия: {len(paths)}. Они пропущены, оригиналы не тронуты:\n\n",
+            )
+            + "\n".join(rows)
+            + T(
+                "\n\nCompress them again one step higher quality?\nThe files will come out somewhat larger; the other settings stay the same.",
+                "\n\nСжать их ещё раз на ступень качественнее?\nФайлы выйдут немного крупнее; остальные настройки те же.",
+            ),
+        ):
             self._launch(self.last_cmd, only=paths)
 
     def _cleanup(self):
-        """После принудительной остановки убрать недописанные временные файлы (только свои, *.nfixer-tmp.mp4)."""
+        """After a forced stop remove unfinished temporary files (only our own, *.nfixer-tmp.mp4)."""
         dirs = {p if os.path.isdir(p) else os.path.dirname(p) for p in self.items}
         if self.out.get().strip():
             dirs.add(self.out.get().strip())
@@ -635,12 +796,19 @@ class App(tk.Tk):
         self.stopped = True
         self.b_stop.configure(state="disabled")
         self.state_text.set(T("Stopping...", "Останавливаю..."))
-        subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"], capture_output=True, creationflags=NO_WINDOW)
+        subprocess.run(
+            ["taskkill", "/PID", str(self.proc.pid), "/T", "/F"], capture_output=True, creationflags=NO_WINDOW
+        )
 
     def _close(self):
         if self.proc:
-            if not messagebox.askyesno(APP, T("A job is still running. Stop it and close?\n\nThe originals stay intact and the job can be continued later.",
-                                              "Работа ещё идёт. Остановить и закрыть?\n\nОригиналы останутся целы, позже можно продолжить.")):
+            if not messagebox.askyesno(
+                APP,
+                T(
+                    "A job is still running. Stop it and close?\n\nThe originals stay intact and the job can be continued later.",
+                    "Работа ещё идёт. Остановить и закрыть?\n\nОригиналы останутся целы, позже можно продолжить.",
+                ),
+            ):
                 return
             self.stop()
             try:
@@ -648,12 +816,14 @@ class App(tk.Tk):
             except Exception:
                 pass
             self._cleanup()
+            if self.workdir:
+                shutil.rmtree(self.workdir, ignore_errors=True)
         self._save_cfg()
         self.destroy()
 
 
 def main():
-    App(initial=sys.argv[1:]).mainloop()  # файлы, брошенные на ярлык, приходят аргументами
+    App(initial=sys.argv[1:]).mainloop()  # files dropped onto the shortcut arrive as arguments
 
 
 if __name__ == "__main__":
